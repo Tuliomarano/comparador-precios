@@ -48,13 +48,26 @@ HEADERS = {
 def _clean_price(value) -> float | None:
     """Convierte string o número a float de precio."""
     if isinstance(value, (int, float)):
-        return float(value)
+        v = float(value)
+        return v if v > 0 else None
     text = re.sub(r"[^\d,.]", "", str(value))
-    text = text.replace(".", "").replace(",", ".")
+    # Formato argentino: puntos como separador de miles, coma como decimal
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
     try:
-        return float(text)
+        v = float(text)
+        return v if v > 0 else None
     except ValueError:
         return None
+
+
+def _limpiar_query(q: str) -> str:
+    """Limpia el texto para búsqueda: normaliza espacios y quita caracteres raros."""
+    q = re.sub(r"[^\w\s]", " ", q)   # quita puntos, guiones, etc.
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
 
 
 def _build_queries(detalle: str, marca: str, cod_proveedor) -> list[str]:
@@ -63,19 +76,28 @@ def _build_queries(detalle: str, marca: str, cod_proveedor) -> list[str]:
     marca   = (marca   or "").strip()
     cod_str = str(int(float(cod_proveedor))) if cod_proveedor and str(cod_proveedor) not in ("nan", "None", "") else None
 
-    for q in [f"{detalle} {marca}" if marca else None, detalle or None, cod_str]:
-        if q and q not in seen:
-            seen.add(q)
-            queries.append(q)
+    candidatos = [
+        f"{detalle} {marca}" if marca else None,
+        detalle or None,
+        cod_str,
+    ]
+    for q in candidatos:
+        if not q:
+            continue
+        q_clean = _limpiar_query(q)
+        if q_clean and q_clean not in seen:
+            seen.add(q_clean)
+            queries.append(q_clean)
     return queries
 
 
-# ── Rex (Vtex API) ──────────────────────────────────────────────────────────────
+# ── Rex ─────────────────────────────────────────────────────────────────────────
 def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    Usa la API de búsqueda de Vtex que Rex expone en:
-    /api/catalog_system/pub/products/search?ft=QUERY
-    Devuelve JSON con productos y precios — sin necesidad de browser.
+    Intenta 3 endpoints de Rex en orden:
+    1. API Vtex catalog (más precisa)
+    2. API Vtex intelligent-search (alternativa)
+    3. Página de resultados HTML + regex de precio
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = {"precio": None, "url": None, "nombre": None, "intento": None, "error": None}
@@ -84,97 +106,157 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
     session.headers.update(HEADERS)
 
     for i, query in enumerate(queries, start=1):
-        try:
-            api_url = (
-                f"https://www.rex.com.ar/api/catalog_system/pub/products/search"
-                f"?ft={urllib.parse.quote(query)}&_from=0&_to=4"
-            )
-            resp = session.get(api_url, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+        q_enc = urllib.parse.quote(query)
+        precio = nombre = link = None
 
-            if not data:
-                continue
+        # Endpoint A: catalog API clásica de Vtex
+        endpoints = [
+            f"https://www.rex.com.ar/api/catalog_system/pub/products/search?ft={q_enc}&_from=0&_to=4",
+            f"https://www.rex.com.ar/_v/api/intelligent-search/product_search/v3?query={q_enc}&count=5&locale=es-AR",
+        ]
+        for ep in endpoints:
+            try:
+                resp = session.get(ep, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
 
-            producto = data[0]
-            nombre   = producto.get("productName")
-            link     = f"https://www.rex.com.ar/{producto.get('linkText', '')}/p"
+                # Formato catalog API: lista de productos
+                if isinstance(data, list) and data:
+                    prod = data[0]
+                    nombre = prod.get("productName")
+                    link   = f"https://www.rex.com.ar/{prod.get('linkText','')}/p"
+                    for item in prod.get("items", []):
+                        for seller in item.get("sellers", []):
+                            oferta = seller.get("commertialOffer", {})
+                            p = oferta.get("Price") or oferta.get("ListPrice")
+                            precio = _clean_price(p)
+                            if precio:
+                                break
+                        if precio:
+                            break
 
-            # Precio: buscar en items → sellers → commertialOffer
-            precio = None
-            for item in producto.get("items", []):
-                for seller in item.get("sellers", []):
-                    oferta = seller.get("commertialOffer", {})
-                    p = oferta.get("Price") or oferta.get("ListPrice")
-                    if p and float(p) > 0:
-                        precio = float(p)
-                        break
+                # Formato intelligent-search: {products: [...]}
+                elif isinstance(data, dict):
+                    prods = data.get("products", data.get("data", {}).get("productSearch", {}).get("products", []))
+                    if prods:
+                        prod   = prods[0]
+                        nombre = prod.get("productName") or prod.get("name")
+                        link   = f"https://www.rex.com.ar/{prod.get('linkText','')}/p"
+                        for item in prod.get("items", []):
+                            for seller in item.get("sellers", []):
+                                oferta = seller.get("commertialOffer", {})
+                                p = oferta.get("Price") or oferta.get("ListPrice")
+                                precio = _clean_price(p)
+                                if precio:
+                                    break
+                            if precio:
+                                break
+
                 if precio:
                     break
+            except Exception as exc:
+                logger.warning("Rex endpoint error: %s", exc)
 
-            if precio:
-                result.update(precio=precio, url=link, nombre=nombre, intento=i)
-                break
+        # Endpoint B: HTML fallback — buscar precio en JSON embebido en la página
+        if not precio:
+            try:
+                url_html = f"https://www.rex.com.ar/{q_enc}?map=ft"
+                resp = session.get(url_html, timeout=15)
+                html = resp.text
+                # Vtex embebe __STATE__ con precios
+                m = re.search(r'"Price"\s*:\s*([\d.]+)', html)
+                if m:
+                    precio = _clean_price(m.group(1))
+                m2 = re.search(r'"productName"\s*:\s*"([^"]+)"', html)
+                if m2:
+                    nombre = m2.group(1)
+                link = url_html
+            except Exception as exc:
+                logger.warning("Rex HTML fallback error: %s", exc)
 
-        except Exception as exc:
-            logger.warning("Rex error intento %d: %s", i, exc)
+        if precio:
+            result.update(precio=precio, url=link, nombre=nombre, intento=i)
+            break
 
     if result["precio"] is None:
         result["error"] = f"Sin resultados en Rex tras {len(queries)} intentos"
     return result
 
 
-# ── Sagitario (WooCommerce search) ──────────────────────────────────────────────
+# ── Sagitario (WooCommerce) ──────────────────────────────────────────────────────
 def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    WooCommerce expone datos estructurados (JSON-LD / application/ld+json) en cada página
-    de resultado. Hacemos GET al search y extraemos el precio del primer producto
-    via regex sobre el JSON-LD embebido en el HTML.
+    Busca en Sagitario (WooCommerce). Estrategia:
+    1. Página de búsqueda → extrae JSON-LD de los productos listados
+    2. Si hay resultado, abre la página del producto para confirmar nombre y precio
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = {"precio": None, "url": None, "nombre": None, "intento": None, "error": None}
 
     session = requests.Session()
-    session.headers.update({**HEADERS, "Accept": "text/html,application/xhtml+xml"})
+    session.headers.update({**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"})
 
     for i, query in enumerate(queries, start=1):
         try:
-            url  = f"https://www.sagitario.com.ar/?s={urllib.parse.quote(query)}&post_type=product"
-            resp = session.get(url, timeout=15)
+            url_busqueda = f"https://www.sagitario.com.ar/?s={urllib.parse.quote(query)}&post_type=product"
+            resp = session.get(url_busqueda, timeout=15)
             resp.raise_for_status()
             html = resp.text
 
-            # Extraer JSON-LD del primer producto
-            matches = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.DOTALL)
             precio = nombre = link = None
-            for m in matches:
+
+            # Intentar JSON-LD
+            ld_blocks = re.findall(
+                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                html, re.DOTALL | re.IGNORECASE
+            )
+            for blk in ld_blocks:
                 try:
-                    obj = json.loads(m)
-                    # Puede ser @graph o directo
-                    items = obj.get("@graph", [obj]) if isinstance(obj, dict) else obj
-                    for item in items:
-                        if item.get("@type") in ("Product", "ItemList"):
-                            if item.get("@type") == "Product":
-                                nombre = item.get("name")
-                                link   = item.get("url")
-                                offers = item.get("offers", {})
-                                if isinstance(offers, list):
-                                    offers = offers[0]
-                                precio = _clean_price(offers.get("price"))
+                    obj = json.loads(blk.strip())
+                    nodes = obj if isinstance(obj, list) else obj.get("@graph", [obj])
+                    for node in nodes:
+                        if node.get("@type") == "Product":
+                            nombre = node.get("name")
+                            link   = node.get("url")
+                            offers = node.get("offers", {})
+                            if isinstance(offers, list):
+                                offers = offers[0]
+                            precio = _clean_price(offers.get("price"))
+                            if precio:
                                 break
+                    if precio:
+                        break
                 except Exception:
                     continue
-                if precio:
-                    break
 
-            # Fallback: regex simple sobre el precio en el HTML
+            # Fallback: extraer URLs de productos del HTML y visitar la primera
             if not precio:
-                m = re.search(r'"price"\s*:\s*"?([\d.,]+)"?', html)
-                if m:
-                    precio = _clean_price(m.group(1))
+                prod_links = re.findall(
+                    r'href="(https://www\.sagitario\.com\.ar/(?!page|categoria|\?)[^"]+)"',
+                    html
+                )
+                # Filtrar URLs que parezcan de producto (no categorías)
+                prod_links = [l for l in prod_links if "/?" not in l][:3]
+                for prod_url in prod_links:
+                    try:
+                        r2 = session.get(prod_url, timeout=10)
+                        h2 = r2.text
+                        # Precio en la página de producto
+                        m_price = re.search(
+                            r'"price"\s*:\s*["\']?([\d.,]+)["\']?', h2
+                        )
+                        m_name  = re.search(r'<h1[^>]*class="[^"]*product[^"]*"[^>]*>(.*?)</h1>', h2, re.DOTALL)
+                        if m_price:
+                            precio = _clean_price(m_price.group(1))
+                            nombre = re.sub(r"<[^>]+>", "", m_name.group(1)).strip() if m_name else None
+                            link   = prod_url
+                            break
+                    except Exception:
+                        continue
 
             if precio:
-                result.update(precio=precio, url=link or url, nombre=nombre, intento=i)
+                result.update(precio=precio, url=link or url_busqueda, nombre=nombre, intento=i)
                 break
 
         except Exception as exc:
