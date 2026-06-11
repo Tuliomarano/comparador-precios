@@ -16,6 +16,8 @@ from io import BytesIO
 def _normalizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
     """Renombra columnas al esquema interno independientemente del nombre original."""
     col_map = {}
+    precio_neto_asignado = False
+
     for col in df.columns:
         c = str(col).upper().strip()
         if "CODIGO" in c and "PROVEEDOR" in c and "INTERNO" not in c:
@@ -28,11 +30,24 @@ def _normalizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
             col_map[col] = "costo"
         elif "PRECIO" in c or "NETO" in c:
             col_map[col] = "precio_neto"
+            precio_neto_asignado = True
         elif "MARCA" in c:
             col_map[col] = "marca"
         elif "PROVEEDOR" in c:
             col_map[col] = "cod_empresa_prov"
-    return df.rename(columns=col_map)
+
+    df = df.rename(columns=col_map)
+
+    # El Excel tiene la columna de precio sin header en fila 1 (el header "PRECIO NETO"
+    # está en fila 2 que salteamos). Pandas la nombra "Unnamed: N". La detectamos
+    # como la columna numérica entre "costo" y "marca" que no tiene nombre asignado.
+    if not precio_neto_asignado:
+        for col in df.columns:
+            if str(col).startswith("Unnamed") and pd.to_numeric(df[col], errors="coerce").notna().sum() > 10:
+                df = df.rename(columns={col: "precio_neto"})
+                break
+
+    return df
 
 
 def _limpiar_productos(df: pd.DataFrame, prov_map: dict) -> pd.DataFrame:
