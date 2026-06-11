@@ -309,38 +309,94 @@ def _rex_candidatos_de_json(data) -> list[dict]:
 
 
 def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """Busca en Rex (VTEX) y devuelve el candidato más relevante con precio."""
+    """
+    Busca en Rex scrapeando la página de resultados HTML.
+    Rex no expone APIs públicas — se parsea el HTML de /busca/?q=QUERY.
+    """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result = _empty_result()
 
     session = requests.Session()
-    session.headers.update({**HEADERS, "Accept": "application/json, text/plain, */*"})
+    session.headers.update(HEADERS)
     session.headers["Referer"] = "https://www.rex.com.ar/"
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        q_enc = urllib.parse.quote(query)
+        q_corta = " ".join(query.split()[:4])   # máx 4 tokens para Rex
+        q_enc   = urllib.parse.quote(q_corta)
         candidatos: list[dict] = []
 
-        # Endpoints VTEX, en orden de preferencia.
-        endpoints = [
-            # Intelligent Search (IO) — el más fiable hoy. tradePolicy=1 por defecto.
-            f"https://www.rex.com.ar/api/io/_v/api/intelligent-search/product_search/?query={q_enc}&count=8&page=1&locale=es-AR",
-            f"https://www.rex.com.ar/_v/api/intelligent-search/product_search/v3?query={q_enc}&count=8&locale=es-AR&hideUnavailableItems=false",
-            # Catalog API clásica.
-            f"https://www.rex.com.ar/api/catalog_system/pub/products/search?ft={q_enc}&_from=0&_to=7",
-        ]
-        for ep in endpoints:
-            try:
-                resp = session.get(ep, timeout=15)
-                if resp.status_code != 200 or not resp.text.strip():
-                    continue
-                data = resp.json()
-                candidatos = _rex_candidatos_de_json(data)
-                if candidatos:
-                    break
-            except Exception as exc:
-                logger.warning("Rex endpoint error (%s): %s", ep[:60], exc)
+        # Página de resultados de búsqueda
+        url_busqueda = f"https://www.rex.com.ar/busca/?q={q_enc}"
+        try:
+            resp = session.get(url_busqueda, timeout=15)
+            if resp.status_code == 200:
+                html = resp.text
+                # Rex embebe __STATE__ con los datos de productos en JSON
+                m = re.search(r'window\.__STATE__\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
+                if m:
+                    try:
+                        state = json.loads(m.group(1))
+                        # Navegar la estructura del estado para encontrar productos
+                        for key, val in state.items():
+                            if isinstance(val, dict) and val.get("productName"):
+                                nombre = val.get("productName")
+                                link_text = val.get("linkText", "")
+                                link = f"https://www.rex.com.ar/{link_text}/p" if link_text else url_busqueda
+                                precio = _rex_extraer_precio(val)
+                                if nombre:
+                                    candidatos.append({"nombre": nombre, "link": link, "precio": precio})
+                    except Exception as exc:
+                        logger.warning("Rex __STATE__ parse error: %s", exc)
+
+                # Fallback: extraer datos del JSON-LD
+                if not candidatos:
+                    for blk in re.findall(
+                        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                        html, re.DOTALL | re.IGNORECASE
+                    ):
+                        try:
+                            obj = json.loads(blk.strip())
+                            nodes = obj if isinstance(obj, list) else [obj]
+                            for node in nodes:
+                                if not isinstance(node, dict):
+                                    continue
+                                if node.get("@type") == "ItemList":
+                                    for el in node.get("itemListElement", []):
+                                        prod = el.get("item", el) if isinstance(el, dict) else {}
+                                        nombre = prod.get("name")
+                                        link   = prod.get("url")
+                                        offers = prod.get("offers", {})
+                                        if isinstance(offers, list):
+                                            offers = offers[0] if offers else {}
+                                        precio = _clean_price(offers.get("price")) if isinstance(offers, dict) else None
+                                        if nombre:
+                                            candidatos.append({"nombre": nombre, "link": link, "precio": precio})
+                                elif node.get("@type") == "Product":
+                                    nombre = node.get("name")
+                                    link   = node.get("url")
+                                    offers = node.get("offers", {})
+                                    if isinstance(offers, list):
+                                        offers = offers[0] if offers else {}
+                                    precio = _clean_price(offers.get("price")) if isinstance(offers, dict) else None
+                                    if nombre:
+                                        candidatos.append({"nombre": nombre, "link": link, "precio": precio})
+                        except Exception:
+                            continue
+
+                # Fallback: regex sobre precios y nombres en el HTML
+                if not candidatos:
+                    nombres_html = re.findall(r'"productName"\s*:\s*"([^"]+)"', html)
+                    precios_html = re.findall(r'"[Pp]rice"\s*:\s*([\d.]+)', html)
+                    links_html   = re.findall(r'"linkText"\s*:\s*"([^"]+)"', html)
+                    for idx, nom in enumerate(nombres_html[:8]):
+                        candidatos.append({
+                            "nombre": _html.unescape(nom),
+                            "link":   f"https://www.rex.com.ar/{links_html[idx]}/p" if idx < len(links_html) else url_busqueda,
+                            "precio": _clean_price(precios_html[idx]) if idx < len(precios_html) else None,
+                        })
+        except Exception as exc:
+            logger.warning("Rex error intento %d: %s", i, exc)
 
         # Fallback: HTML con __STATE__ embebido (VTEX render).
         if not candidatos:
@@ -652,13 +708,24 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
         except Exception as exc:
             logger.warning("ML API error: %s", exc)
 
-        # ── Intento B: HTML de listado (si API no devolvió nada) ───────────────
+        # ── Intento B: página de búsqueda estándar de ML ──────────────────────
+        if not candidatos:
+            try:
+                # URL de búsqueda pública de ML Argentina
+                url_search = f"https://www.mercadolibre.com.ar/search?q={urllib.parse.quote(query_corta)}&sort=relevance_v2"
+                resp_html = session.get(url_search, timeout=15)
+                if resp_html.status_code == 200 and "suspicious-traffic" not in resp_html.url:
+                    candidatos = _ml_candidatos_de_html(resp_html.text)
+            except Exception as exc:
+                logger.warning("ML search page error: %s", exc)
+
+        # ── Intento C: listado con slug ────────────────────────────────────────
         if not candidatos:
             try:
                 slug = re.sub(r"\s+", "-", query_corta.strip().lower())
                 url_html = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
                 resp_html = session.get(url_html, timeout=15)
-                if resp_html.status_code == 200:
+                if resp_html.status_code == 200 and "suspicious-traffic" not in resp_html.url:
                     candidatos = _ml_candidatos_de_html(resp_html.text)
             except Exception as exc:
                 logger.warning("ML HTML error: %s", exc)

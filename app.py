@@ -202,11 +202,12 @@ with tab_individual:
                 q0 = queries_dbg[0]["q"] if queries_dbg else detalle_dbg
                 q_corta = " ".join(q0.split()[:3])
                 urls_test = {
-                    "ML API":       f"https://api.mercadolibre.com/sites/MLA/search?q={_up.quote(q_corta)}&limit=5",
-                    "ML listado":   f"https://listado.mercadolibre.com.ar/{_up.quote(q_corta.replace(' ','-'))}",
-                    "Rex catalog":  f"https://www.rex.com.ar/api/catalog_system/pub/products/search?ft={_up.quote(q0)}&_from=0&_to=4",
-                    "Rex IO":       f"https://www.rex.com.ar/api/io/_v/api/intelligent-search/product_search/?query={_up.quote(q0)}&count=5&locale=es-AR",
-                    "Sagitario":    f"https://www.sagitario.com.ar/?s={_up.quote(q0)}&post_type=product",
+                    "ML API":        f"https://api.mercadolibre.com/sites/MLA/search?q={_up.quote(q_corta)}&limit=5",
+                    "ML search":     f"https://www.mercadolibre.com.ar/search?q={_up.quote(q_corta)}&sort=relevance_v2",
+                    "ML listado":    f"https://listado.mercadolibre.com.ar/{_up.quote(q_corta.replace(' ','-'))}",
+                    "Rex busca":     f"https://www.rex.com.ar/busca/?q={_up.quote(q_corta)}",
+                    "Rex map=ft":    f"https://www.rex.com.ar/{_up.quote(q_corta.replace(' ','+'))}?map=ft",
+                    "Sagitario":     f"https://www.sagitario.com.ar/?s={_up.quote(q0)}&post_type=product",
                 }
                 for nombre_url, url in urls_test.items():
                     try:
