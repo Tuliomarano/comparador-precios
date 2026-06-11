@@ -11,7 +11,8 @@ import pandas as pd
 from datetime import datetime
 
 from data import cargar_desde_uploads, cargar_desde_disco, buscar_productos, get_producto_por_codigo
-from scrapers import buscar_precios
+from scrapers import buscar_precios, _build_queries, _query_comercial, score_similitud
+import requests
 
 # ── Configuración de página ─────────────────────────────────────────────────────
 st.set_page_config(
@@ -181,6 +182,39 @@ with tab_individual:
                 st.metric("Margen bruto", "—")
 
         st.divider()
+
+        # ── Panel de diagnóstico ────────────────────────────────────────────
+        with st.expander("🔧 Diagnóstico (expandir para ver qué URLs se prueban)"):
+            detalle_dbg = str(p.get("detalle", ""))
+            marca_dbg   = str(p.get("marca", ""))
+            cod_dbg     = p.get("cod_proveedor")
+            queries_dbg = _build_queries(detalle_dbg, marca_dbg, cod_dbg)
+            st.write("**Queries que se enviarán (en orden):**", [q["q"] for q in queries_dbg])
+            st.write("**Query comercial ML (primeras 3 palabras):**",
+                     " ".join(_query_comercial(detalle_dbg, marca_dbg).split()[:3]))
+
+            if st.button("🧪 Probar URLs directamente"):
+                import urllib.parse as _up
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept-Language": "es-AR,es;q=0.9",
+                }
+                q0 = queries_dbg[0]["q"] if queries_dbg else detalle_dbg
+                q_corta = " ".join(q0.split()[:3])
+                urls_test = {
+                    "ML API":       f"https://api.mercadolibre.com/sites/MLA/search?q={_up.quote(q_corta)}&limit=5",
+                    "ML listado":   f"https://listado.mercadolibre.com.ar/{_up.quote(q_corta.replace(' ','-'))}",
+                    "Rex catalog":  f"https://www.rex.com.ar/api/catalog_system/pub/products/search?ft={_up.quote(q0)}&_from=0&_to=4",
+                    "Rex IO":       f"https://www.rex.com.ar/api/io/_v/api/intelligent-search/product_search/?query={_up.quote(q0)}&count=5&locale=es-AR",
+                    "Sagitario":    f"https://www.sagitario.com.ar/?s={_up.quote(q0)}&post_type=product",
+                }
+                for nombre_url, url in urls_test.items():
+                    try:
+                        r = requests.get(url, headers=headers, timeout=10)
+                        preview = r.text[:300].replace("\n", " ")
+                        st.code(f"[{nombre_url}] HTTP {r.status_code}\nURL: {url}\nRespuesta: {preview}", language="text")
+                    except Exception as e:
+                        st.code(f"[{nombre_url}] ERROR: {e}\nURL: {url}", language="text")
 
         if st.button("🌐 Buscar precios en Rex / Sagitario / ML", type="primary"):
             detalle          = str(p.get("detalle", ""))
