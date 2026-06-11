@@ -6,9 +6,19 @@ Ejecutar localmente:
 """
 
 import io
+import os
+import subprocess
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+
+# ── Instalar Chromium para Playwright (solo corre una vez en Streamlit Cloud) ───
+@st.cache_resource(show_spinner="Instalando navegador… (solo la primera vez, ~1 min)")
+def _install_playwright():
+    subprocess.run(["playwright", "install", "chromium"], check=False, capture_output=True)
+    subprocess.run(["playwright", "install-deps", "chromium"], check=False, capture_output=True)
+
+_install_playwright()
 
 from data import cargar_desde_uploads, cargar_desde_disco, buscar_productos, get_producto_por_codigo
 from scrapers import buscar_precios

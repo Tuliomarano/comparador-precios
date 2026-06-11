@@ -34,8 +34,7 @@ ML_SITE_ID     = "MLA"
 ML_API         = "https://api.mercadolibre.com"
 TIMEOUT_MS     = 15_000
 
-# Chromium instalado via packages.txt en Streamlit Cloud
-CHROMIUM_PATH  = "/usr/bin/chromium-browser"
+CHROMIUM_PATH  = None  # Playwright usa su propio binario
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -66,12 +65,11 @@ def _build_queries(detalle: str, marca: str, cod_proveedor) -> list[str]:
 
 
 def _launch_browser(pw):
-    """Lanza Chromium usando el binario del sistema si existe, sino el de Playwright."""
-    import os
-    kwargs = dict(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-    if os.path.exists(CHROMIUM_PATH):
-        kwargs["executable_path"] = CHROMIUM_PATH
-    return pw.chromium.launch(**kwargs)
+    """Lanza Chromium con flags compatibles con entornos sin sandbox (Streamlit Cloud)."""
+    return pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    )
 
 
 # ── Rex ─────────────────────────────────────────────────────────────────────────
