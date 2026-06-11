@@ -301,7 +301,7 @@ def _rex_candidatos_de_json(data) -> list[dict]:
     for prod in prods[:8]:
         nombre = prod.get("productName") or prod.get("name")
         link_text = prod.get("linkText", "")
-        link = f"https://www.rex.com.ar/{link_text}/p" if link_text else "https://www.rex.com.ar"
+        link = f"https://www.somosrex.com/{link_text}/p" if link_text else "https://www.somosrex.com"
         precio = _rex_extraer_precio(prod)
         if nombre:
             cands.append({"nombre": nombre, "link": link, "precio": precio})
@@ -318,7 +318,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
 
     session = requests.Session()
     session.headers.update(HEADERS)
-    session.headers["Referer"] = "https://www.rex.com.ar/"
+    session.headers["Referer"] = "https://www.somosrex.com/"
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
@@ -327,7 +327,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
         candidatos: list[dict] = []
 
         # Página de resultados de búsqueda
-        url_busqueda = f"https://www.rex.com.ar/busca/?q={q_enc}"
+        url_busqueda = f"https://www.somosrex.com/busca/?q={q_enc}"
         try:
             resp = session.get(url_busqueda, timeout=15)
             if resp.status_code == 200:
@@ -342,7 +342,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
                             if isinstance(val, dict) and val.get("productName"):
                                 nombre = val.get("productName")
                                 link_text = val.get("linkText", "")
-                                link = f"https://www.rex.com.ar/{link_text}/p" if link_text else url_busqueda
+                                link = f"https://www.somosrex.com/{link_text}/p" if link_text else url_busqueda
                                 precio = _rex_extraer_precio(val)
                                 if nombre:
                                     candidatos.append({"nombre": nombre, "link": link, "precio": precio})
@@ -392,7 +392,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
                     for idx, nom in enumerate(nombres_html[:8]):
                         candidatos.append({
                             "nombre": _html.unescape(nom),
-                            "link":   f"https://www.rex.com.ar/{links_html[idx]}/p" if idx < len(links_html) else url_busqueda,
+                            "link":   f"https://www.somosrex.com/{links_html[idx]}/p" if idx < len(links_html) else url_busqueda,
                             "precio": _clean_price(precios_html[idx]) if idx < len(precios_html) else None,
                         })
         except Exception as exc:
@@ -401,7 +401,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
         # Fallback: HTML con __STATE__ embebido (VTEX render).
         if not candidatos:
             try:
-                url_html = f"https://www.rex.com.ar/{q_enc}?map=ft"
+                url_html = f"https://www.somosrex.com/{q_enc}?map=ft"
                 resp = session.get(url_html, timeout=15,
                                    headers={**session.headers, "Accept": HEADERS["Accept"]})
                 html = resp.text
@@ -412,7 +412,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
                 for idx, nom in enumerate(nombres[:8]):
                     candidatos.append({
                         "nombre": _html.unescape(nom),
-                        "link": (f"https://www.rex.com.ar/{links[idx]}/p"
+                        "link": (f"https://www.somosrex.com/{links[idx]}/p"
                                  if idx < len(links) else url_html),
                         "precio": _clean_price(precios[idx]) if idx < len(precios) else None,
                     })
@@ -490,7 +490,7 @@ def _sagitario_candidatos_de_html(html: str) -> list[dict]:
             if nombre and len(nombre) > 3:
                 link = m.group(1)
                 if link.startswith("/"):
-                    link = "https://www.sagitario.com.ar" + link
+                    link = "https://pintureriasagitario.com.ar" + link
                 cands.append({"nombre": nombre, "link": _html.unescape(link), "precio": None})
 
     # de-duplicar por link
@@ -570,7 +570,7 @@ def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: 
         query, ref = item["q"], item["ref"]
         try:
             url_busqueda = (
-                "https://www.sagitario.com.ar/?"
+                "https://pintureriasagitario.com.ar/?"
                 + urllib.parse.urlencode({"s": query, "post_type": "product"})
             )
             resp = session.get(url_busqueda, timeout=15)
