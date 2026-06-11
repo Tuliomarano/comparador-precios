@@ -97,7 +97,7 @@ if df is None:
         - 📄 `Master Prov - DD-MM.XLSX` *(opcional)* — tabla de proveedores para ver el nombre
 
         Una vez cargado el archivo, podrás buscar cualquier producto y consultar
-        los precios actuales en Rex, Sagitario y MercadoLibre.
+        los precios actuales en Rex, Sagitario, MercadoLibre, Sodimac y Easy.
         """
     )
     st.stop()
@@ -205,9 +205,10 @@ with tab_individual:
                     "ML API":        f"https://api.mercadolibre.com/sites/MLA/search?q={_up.quote(q_corta)}&limit=5",
                     "ML search":     f"https://www.mercadolibre.com.ar/search?q={_up.quote(q_corta)}&sort=relevance_v2",
                     "ML listado":    f"https://listado.mercadolibre.com.ar/{_up.quote(q_corta.replace(' ','-'))}",
-                    "Rex busca":     f"https://www.somosrex.com/busca/?q={_up.quote(q_corta)}",
-                    "Rex map=ft":    f"https://www.somosrex.com/{_up.quote(q_corta.replace(' ','+'))}?map=ft",
-                    "Sagitario":     f"https://pintureriasagitario.com.ar/?s={_up.quote(q0)}&post_type=product",
+                    "Rex (Magento)":  f"https://www.somosrex.com/catalogsearch/result/?q={_up.quote(q_corta)}",
+                    "Sagitario":      f"https://pintureriasagitario.com.ar/?s={_up.quote(q0)}&post_type=product",
+                    "Sodimac":        f"https://www.sodimac.com.ar/sodimac-ar/search?Ntt={_up.quote(q_corta)}",
+                    "Easy":           f"https://www.easy.com.ar/search?q={_up.quote(q_corta)}",
                 }
                 for nombre_url, url in urls_test.items():
                     try:
@@ -217,13 +218,13 @@ with tab_individual:
                     except Exception as e:
                         st.code(f"[{nombre_url}] ERROR: {e}\nURL: {url}", language="text")
 
-        if st.button("🌐 Buscar precios en Rex / Sagitario / ML", type="primary"):
+        if st.button("🌐 Buscar precios en Rex / Sagitario / ML / Sodimac / Easy", type="primary"):
             detalle          = str(p.get("detalle", ""))
             marca            = str(p.get("marca", ""))
             cod_proveedor    = p.get("cod_proveedor")
             nombre_proveedor = str(p.get("nombre_proveedor", ""))
 
-            with st.spinner("Consultando precios… puede tardar hasta 30 segundos"):
+            with st.spinner("Consultando precios… puede tardar hasta 45 segundos"):
                 precios = buscar_precios(detalle, marca, cod_proveedor, nombre_proveedor)
 
             filas = []
@@ -312,19 +313,18 @@ with tab_masivo:
                     str(p.get("nombre_proveedor", "")),
                 )
                 return {
-                    "cod_interno":    cod,
-                    "detalle":        p.get("detalle"),
-                    "marca":          p.get("marca"),
-                    "proveedor":      p.get("nombre_proveedor"),
-                    "costo":          p.get("costo"),
-                    "precio_neto":    p.get("precio_neto"),
-                    "rex ($)":        precios["rex"].get("precio"),
-                    "sagitario ($)":  precios["sagitario"].get("precio"),
-                    "ml ($)":         precios["ml"].get("precio"),
-                    "rex fallback":   precios["rex"].get("intento"),
-                    "sag fallback":   precios["sagitario"].get("intento"),
-                    "ml fallback":    precios["ml"].get("intento"),
-                    "fecha costos":   fecha_costos.strftime("%d/%m/%Y"),
+                    "cod_interno":      cod,
+                    "detalle":          p.get("detalle"),
+                    "marca":            p.get("marca"),
+                    "proveedor":        p.get("nombre_proveedor"),
+                    "costo":            p.get("costo"),
+                    "precio_neto":      p.get("precio_neto"),
+                    "rex ($)":          precios["rex"].get("precio"),
+                    "sagitario ($)":    precios["sagitario"].get("precio"),
+                    "ml ($)":           precios["ml"].get("precio"),
+                    "sodimac ($)":      precios["sodimac"].get("precio"),
+                    "easy ($)":         precios["easy"].get("precio"),
+                    "fecha costos":     fecha_costos.strftime("%d/%m/%Y"),
                 }
 
             with st.spinner(f"Consultando {len(codigos)} productos…"):

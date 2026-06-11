@@ -1,33 +1,15 @@
 """
-scrapers.py — Búsqueda de precios en Rex, Sagitario y MercadoLibre.
+scrapers.py — Búsqueda de precios en Rex, Sagitario, MercadoLibre, Sodimac y Easy.
 
-Usa SOLO `requests` (sin Playwright/browser) para compatibilidad con
-Streamlit Cloud. Cada scraper:
+Usa `cloudscraper` para bypass de Cloudflare y protecciones anti-bot básicas.
+Sin Playwright (incompatible con Streamlit Cloud).
 
-  1. Construye una cascada de queries (detalle+marca → detalle → código).
-  2. Por cada query trae VARIOS candidatos.
-  3. Puntúa la relevancia de cada candidato contra lo buscado.
-  4. Descarta candidatos con score por debajo del umbral (evita devolver
-     "Buzo Coronados" cuando se buscaba "RECUP TECHOS BLANCO SINTEPLAST").
-  5. Devuelve el mejor candidato relevante.
-
-Cada scraper devuelve:
-    {
-        "precio":  float | None,
-        "url":     str | None,
-        "nombre":  str | None,
-        "intento": int | None,
-        "score":   float | None,   # 0..1, qué tan relevante fue el match
-        "error":   str | None,
-    }
-
-Notas de plataforma (junio 2026):
-  - MercadoLibre desactivó la búsqueda anónima de /sites/MLA/search (devuelve
-    403). Por eso ML se scrapea desde el HTML público de listado.mercadolibre.
-  - Rex corre sobre VTEX: se usa Intelligent Search + catalog API + fallback
-    al __STATE__ embebido en el HTML.
-  - Sagitario es una tienda estándar (WooCommerce/Tiendanube): se parsea el
-    listado de búsqueda, se puntúa cada producto y se confirma en su página.
+Plataformas detectadas (jun 2026):
+  - Rex        → somosrex.com        → Magento  (/catalogsearch/result/?q=)
+  - Sagitario  → pintureriasagitario.com.ar → WooCommerce (/?s=&post_type=product)
+  - ML         → listado.mercadolibre.com.ar → HTML (API anon. 403)
+  - Sodimac    → sodimac.com.ar              → ATG/propio (/sodimac-ar/search?Ntt=)
+  - Easy       → easy.com.ar                 → propio (/search?q=)
 """
 
 import re
@@ -40,9 +22,13 @@ import urllib.parse
 
 import requests
 
-logger = logging.getLogger(__name__)
+try:
+    import cloudscraper as _cs_mod
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
 
-ML_SITE_ID = "MLA"
+logger = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -60,44 +46,51 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Score mínimo para aceptar un candidato como "el mismo producto".
-# "Buzo Coronados" vs "RECUP TECHOS" = 0.023 → descartado.
-# "Membrana Recuplast Techos 20kg" vs "RECUP TECHOS 20 KGS" = ~0.75 → aceptado.
 SCORE_MIN = 0.20
 
-# Palabras de relleno que no aportan a la identificación del producto.
 _STOPWORDS = {
     "de", "la", "el", "los", "las", "un", "una", "y", "o", "con", "para",
     "por", "en", "del", "al", "lt", "lts", "kg", "kgs", "x", "und", "uni",
     "unidad", "color", "tono",
 }
 
-# Sinónimos / normalizaciones de nombres internos → nombre comercial.
-# Mapea tokens del detalle técnico a como aparecen en los sitios públicos.
 _SINONIMOS = {
-    "recup": "recuplast",
-    "memb": "membrana",
-    "membr": "membrana",
-    "imperm": "impermeabilizante",
-    "latex": "latex",
-    "ext": "exterior",
-    "int": "interior",
-    "blco": "blanco",
-    "blca": "blanca",
-    "negr": "negro",
-    "antiox": "antioxido",
-    "sintet": "sintetico",
-    "esmalte": "esmalte",
-    "diluy": "diluyente",
-    "aguarras": "aguarras",
-    "fij": "fijador",
-    "fijad": "fijador",
+    "recup":    "recuplast",
+    "memb":     "membrana",
+    "membr":    "membrana",
+    "imperm":   "impermeabilizante",
+    "ext":      "exterior",
+    "int":      "interior",
+    "blco":     "blanco",
+    "blca":     "blanca",
+    "negr":     "negro",
+    "antiox":   "antioxido",
+    "sintet":   "sintetico",
+    "diluy":    "diluyente",
+    "fij":      "fijador",
+    "fijad":    "fijador",
 }
 
 
-# ── Helpers de precio / texto ─────────────────────────────────────────────────────
+# ── Session factory ───────────────────────────────────────────────────────────────
+def _make_scraper():
+    """
+    Devuelve un cloudscraper que bypasea Cloudflare y anti-bots básicos.
+    Si cloudscraper no está instalado, usa requests.Session como fallback.
+    """
+    if _HAS_CLOUDSCRAPER:
+        sc = _cs_mod.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        sc.headers.update(HEADERS)
+        return sc
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+# ── Helpers de precio y texto ─────────────────────────────────────────────────────
 def _clean_price(value) -> float | None:
-    """Convierte string o número a float de precio (formato AR: 1.234,56)."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -107,17 +100,13 @@ def _clean_price(value) -> float | None:
     if not text:
         return None
     if "," in text and "." in text:
-        # 1.234,56 -> 1234.56
         text = text.replace(".", "").replace(",", ".")
     elif "," in text:
-        # 1234,56 -> 1234.56  (pero 1,234 podría ser miles; asumimos decimal AR)
-        # Si hay exactamente 3 dígitos tras la coma, es separador de miles.
         if re.match(r"^\d{1,3},\d{3}$", text):
             text = text.replace(",", "")
         else:
             text = text.replace(",", ".")
     else:
-        # Solo puntos: si hay un punto con 3 dígitos detrás, es miles.
         if re.match(r"^\d{1,3}(\.\d{3})+$", text):
             text = text.replace(".", "")
     try:
@@ -128,26 +117,20 @@ def _clean_price(value) -> float | None:
 
 
 def _normalizar_texto(s: str) -> str:
-    """Minúsculas, sin acentos, sin signos, con unidades normalizadas."""
     if not s:
         return ""
     s = _html.unescape(str(s)).lower()
-    # quitar acentos básicos
-    for a, b in (("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ü", "u"), ("ñ", "n")):
+    for a, b in (("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ü","u"),("ñ","n")):
         s = s.replace(a, b)
-    # normalizar unidades: "20 kgs" / "20 kg." / "20kgs" -> "20kg"
-    s = re.sub(r"(\d+)\s*(kgs?|kilos?)\b", r"\1kg", s)
+    s = re.sub(r"(\d+)\s*(kgs?|kilos?)\b",  r"\1kg", s)
     s = re.sub(r"(\d+)\s*(lts?|litros?|l)\b", r"\1lt", s)
-    s = re.sub(r"(\d+)\s*(grs?|gramos?)\b", r"\1gr", s)
-    s = re.sub(r"(\d+)\s*(ml|cc)\b", r"\1ml", s)
-    # quitar todo lo que no sea alfanumérico
+    s = re.sub(r"(\d+)\s*(grs?|gramos?)\b",  r"\1gr", s)
+    s = re.sub(r"(\d+)\s*(ml|cc)\b",         r"\1ml", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _tokens(s: str) -> list[str]:
-    """Tokens significativos (sin stopwords, con sinónimos aplicados)."""
     out = []
     for t in _normalizar_texto(s).split():
         if t in _STOPWORDS or len(t) <= 1:
@@ -157,29 +140,13 @@ def _tokens(s: str) -> list[str]:
 
 
 def score_similitud(buscado: str, encontrado: str) -> float:
-    """
-    Score 0..1 de cuán parecido es `encontrado` a lo `buscado`.
-
-    Combina:
-      - Cobertura de tokens clave de la búsqueda presentes en el resultado.
-      - Match de números/unidades (ej "20kg") que son muy discriminantes.
-      - Similitud difusa global (difflib) como desempate.
-
-    Devuelve 0 si no comparten ningún token relevante.
-    """
     tb = _tokens(buscado)
     te = _tokens(encontrado)
     if not tb or not te:
         return 0.0
-
     set_b, set_e = set(tb), set(te)
-
-    # 1) Cobertura de tokens (cuántas palabras de la búsqueda están en el match)
     comunes = set_b & set_e
     cobertura = len(comunes) / len(set_b)
-
-    # Match parcial (substring) para tokens que no calzan exacto:
-    # ej "recuplast" en búsqueda vs "recuplast" en título largo.
     if cobertura < 1.0:
         extra = 0
         faltantes = set_b - set_e
@@ -187,23 +154,11 @@ def score_similitud(buscado: str, encontrado: str) -> float:
             if any(tok in e or e in tok for e in set_e if len(tok) >= 4 and len(e) >= 4):
                 extra += 1
         cobertura = min(1.0, cobertura + extra / len(set_b))
-
-    # 2) Bonus/penalización por números y unidades (muy discriminantes)
     nums_b = {t for t in set_b if any(c.isdigit() for c in t)}
     nums_e = {t for t in set_e if any(c.isdigit() for c in t)}
-    if nums_b:
-        match_num = len(nums_b & nums_e) / len(nums_b)
-    else:
-        match_num = 1.0  # no había números que verificar
-
-    # 3) Similitud difusa global
-    fuzzy = difflib.SequenceMatcher(
-        None, " ".join(tb), " ".join(te)
-    ).ratio()
-
-    # Ponderación: la cobertura manda, los números afinan, fuzzy desempata.
-    score = 0.60 * cobertura + 0.25 * match_num + 0.15 * fuzzy
-    return round(min(1.0, score), 3)
+    match_num = len(nums_b & nums_e) / len(nums_b) if nums_b else 1.0
+    fuzzy = difflib.SequenceMatcher(None, " ".join(tb), " ".join(te)).ratio()
+    return round(min(1.0, 0.60 * cobertura + 0.25 * match_num + 0.15 * fuzzy), 3)
 
 
 # ── Construcción de queries ───────────────────────────────────────────────────────
@@ -218,42 +173,20 @@ def _cod_str(cod_proveedor) -> str | None:
 
 
 def _query_comercial(detalle: str, marca: str) -> str:
-    """
-    Convierte el detalle técnico interno en una query 'comercial' apta para
-    buscadores públicos: aplica sinónimos, normaliza unidades y arma una frase
-    corta con las palabras más identificatorias + la marca.
-    """
     toks = _tokens(detalle)
     marca_toks = _tokens(marca)
-    # Evitar duplicar la marca si ya está en el detalle.
-    base = [t for t in toks if t not in set(marca_toks)]
-    # Limitar a las primeras ~6 palabras clave para no sobre-restringir.
-    base = base[:6]
-    full = base + marca_toks
-    return " ".join(full).strip()
+    base = [t for t in toks if t not in set(marca_toks)][:6]
+    return " ".join(base + marca_toks).strip()
 
 
 def _build_queries(detalle: str, marca: str, cod_proveedor) -> list[dict]:
-    """
-    Devuelve lista ordenada de queries con metadatos:
-        {"q": <texto>, "ref": <texto de referencia para scoring>}
-
-    `ref` siempre incluye detalle+marca para puntuar relevancia, aunque la
-    query enviada al sitio sea más corta o sea el código.
-    """
     detalle = (detalle or "").strip()
-    marca = (marca or "").strip()
-    ref = f"{detalle} {marca}".strip()
-    cod = _cod_str(cod_proveedor)
-
-    q_comercial = _query_comercial(detalle, marca)
-    q_solo_det = " ".join(_tokens(detalle)[:6])
-
-    candidatos = [
-        q_comercial,            # detalle (comercial) + marca
-        q_solo_det,             # solo detalle
-        cod,                    # código proveedor
-    ]
+    marca   = (marca   or "").strip()
+    ref     = f"{detalle} {marca}".strip()
+    cod     = _cod_str(cod_proveedor)
+    q_com   = _query_comercial(detalle, marca)
+    q_det   = " ".join(_tokens(detalle)[:6])
+    candidatos = [q_com, q_det, cod]
     queries, seen = [], set()
     for q in candidatos:
         if not q:
@@ -271,215 +204,184 @@ def _empty_result() -> dict:
             "intento": None, "score": None, "error": None}
 
 
-# ── Rex (VTEX) ────────────────────────────────────────────────────────────────────
-def _rex_extraer_precio(prod: dict) -> float | None:
-    """Extrae el primer precio válido de un producto VTEX."""
-    for item in prod.get("items", []):
-        for seller in item.get("sellers", []):
-            oferta = seller.get("commertialOffer") or seller.get("commercialOffer") or {}
-            p = oferta.get("Price") or oferta.get("spotPrice") or oferta.get("ListPrice")
-            precio = _clean_price(p)
-            if precio:
-                return precio
-    # Algunos payloads de intelligent-search traen priceRange.
-    pr = prod.get("priceRange", {}).get("sellingPrice", {}).get("lowPrice")
-    return _clean_price(pr)
+# ── Extractores genéricos ─────────────────────────────────────────────────────────
+def _push_ld_product(node: dict, cands: list[dict]):
+    if not isinstance(node, dict):
+        return
+    nombre = node.get("name")
+    if not nombre:
+        return
+    link = node.get("url") or node.get("@id")
+    offers = node.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+    precio = (
+        _clean_price(offers.get("price") or offers.get("lowPrice"))
+        if isinstance(offers, dict) else None
+    )
+    cands.append({"nombre": nombre, "link": link, "precio": precio})
 
 
-def _rex_candidatos_de_json(data) -> list[dict]:
-    """Normaliza distintas formas de respuesta VTEX a [{nombre,link,precio}]."""
-    prods = []
-    if isinstance(data, list):
-        prods = data
-    elif isinstance(data, dict):
-        prods = (
-            data.get("products")
-            or data.get("data", {}).get("productSearch", {}).get("products")
-            or []
-        )
-    cands = []
-    for prod in prods[:8]:
-        nombre = prod.get("productName") or prod.get("name")
-        link_text = prod.get("linkText", "")
-        link = f"https://www.somosrex.com/{link_text}/p" if link_text else "https://www.somosrex.com"
-        precio = _rex_extraer_precio(prod)
-        if nombre:
-            cands.append({"nombre": nombre, "link": link, "precio": precio})
+def _candidatos_de_jsonld(html: str) -> list[dict]:
+    """Extrae candidatos de bloques JSON-LD (funciona en cualquier sitio moderno)."""
+    cands: list[dict] = []
+    for blk in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            obj = json.loads(blk.strip())
+        except Exception:
+            continue
+        nodes = obj if isinstance(obj, list) else obj.get("@graph", [obj])
+        nodes = nodes if isinstance(nodes, list) else [nodes]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            t = node.get("@type", "")
+            tlist = t if isinstance(t, list) else [t]
+            if "ItemList" in tlist:
+                for el in node.get("itemListElement", []):
+                    prod = el.get("item", el) if isinstance(el, dict) else {}
+                    _push_ld_product(prod, cands)
+            if "Product" in tlist:
+                _push_ld_product(node, cands)
     return cands
 
 
-def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """
-    Busca en Rex scrapeando la página de resultados HTML.
-    Rex no expone APIs públicas — se parsea el HTML de /busca/?q=QUERY.
-    """
-    queries = _build_queries(detalle, marca, cod_proveedor)
-    result = _empty_result()
+def _dedup_candidatos(cands: list[dict]) -> list[dict]:
+    vistos, unicos = set(), []
+    for c in cands:
+        k = (c.get("nombre") or "").lower()[:60]
+        if k and k not in vistos:
+            vistos.add(k)
+            unicos.append(c)
+    return unicos
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    session.headers["Referer"] = "https://www.somosrex.com/"
+
+def _elegir_mejor(candidatos: list[dict], ref: str) -> dict | None:
+    if not candidatos:
+        return None
+    for c in candidatos:
+        c["score"] = score_similitud(ref, c.get("nombre", ""))
+    candidatos.sort(key=lambda c: c["score"], reverse=True)
+    for c in candidatos:
+        if c["score"] >= SCORE_MIN and c.get("precio"):
+            return c
+    mejor = candidatos[0]
+    return mejor if mejor["score"] >= SCORE_MIN and mejor.get("precio") else None
+
+
+# ── Rex — Magento ──────────────────────────────────────────────────────────────────
+def _rex_candidatos_de_html(html: str, base_url: str) -> list[dict]:
+    cands = _candidatos_de_jsonld(html)
+
+    # Magento: tarjetas <li class="item product product-item">
+    if not cands:
+        for m in re.finditer(
+            r'<li[^>]*class="[^"]*\bproduct[^"]*\bitem[^"]*"[^>]*>(.*?)</li>',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            blk = m.group(1)
+            href = re.search(r'href="(https://[^"]+)"', blk)
+            nom_m = (
+                re.search(r'class="product-item-link"[^>]*>(.*?)</a>', blk, re.DOTALL)
+                or re.search(r'<a[^>]+href="https://[^"]+"[^>]*>(.*?)</a>', blk, re.DOTALL)
+            )
+            # Magento embebe el precio como data-price-amount="1234.56"
+            price_m = re.search(r'data-price-amount="([\d.]+)"', blk)
+            if not price_m:
+                price_m = re.search(r'<span[^>]*class="[^"]*\bprice\b[^"]*"[^>]*>[\s\$]*([\d.,]+)', blk)
+            if href and nom_m:
+                nombre = re.sub(r"<[^>]+>", "", nom_m.group(1)).strip()
+                if nombre:
+                    cands.append({
+                        "nombre": _html.unescape(nombre),
+                        "link":   href.group(1),
+                        "precio": _clean_price(price_m.group(1)) if price_m else None,
+                    })
+
+    # Fallback: JSON embedded en la página (Magento a veces tiene window.productList o similar)
+    if not cands:
+        nombres = re.findall(r'"name"\s*:\s*"([^"]{5,100})"', html)
+        precios = (
+            re.findall(r'"finalPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)', html)
+            or re.findall(r'"regularPrice"\s*:\s*([\d.]+)', html)
+            or re.findall(r'"Price"\s*:\s*([\d.]+)', html)
+        )
+        hrefs = re.findall(r'"url"\s*:\s*"(https://www\.somosrex\.com/[^"]+)"', html)
+        for idx, nom in enumerate(nombres[:8]):
+            link = hrefs[idx] if idx < len(hrefs) else base_url
+            cands.append({
+                "nombre": _html.unescape(nom),
+                "link":   link,
+                "precio": _clean_price(precios[idx]) if idx < len(precios) else None,
+            })
+
+    return _dedup_candidatos(cands)
+
+
+def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+    """Busca en somosrex.com (Magento) usando la URL /catalogsearch/result/?q="""
+    queries = _build_queries(detalle, marca, cod_proveedor)
+    result  = _empty_result()
+    scraper = _make_scraper()
+    scraper.headers.update({"Referer": "https://www.somosrex.com/"})
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        q_corta = " ".join(query.split()[:4])   # máx 4 tokens para Rex
+        q_corta = " ".join(query.split()[:5])
         q_enc   = urllib.parse.quote(q_corta)
-        candidatos: list[dict] = []
-
-        # Página de resultados de búsqueda
-        url_busqueda = f"https://www.somosrex.com/busca/?q={q_enc}"
+        url     = f"https://www.somosrex.com/catalogsearch/result/?q={q_enc}"
         try:
-            resp = session.get(url_busqueda, timeout=15)
-            if resp.status_code == 200:
-                html = resp.text
-                # Rex embebe __STATE__ con los datos de productos en JSON
-                m = re.search(r'window\.__STATE__\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
-                if m:
-                    try:
-                        state = json.loads(m.group(1))
-                        # Navegar la estructura del estado para encontrar productos
-                        for key, val in state.items():
-                            if isinstance(val, dict) and val.get("productName"):
-                                nombre = val.get("productName")
-                                link_text = val.get("linkText", "")
-                                link = f"https://www.somosrex.com/{link_text}/p" if link_text else url_busqueda
-                                precio = _rex_extraer_precio(val)
-                                if nombre:
-                                    candidatos.append({"nombre": nombre, "link": link, "precio": precio})
-                    except Exception as exc:
-                        logger.warning("Rex __STATE__ parse error: %s", exc)
-
-                # Fallback: extraer datos del JSON-LD
-                if not candidatos:
-                    for blk in re.findall(
-                        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                        html, re.DOTALL | re.IGNORECASE
-                    ):
-                        try:
-                            obj = json.loads(blk.strip())
-                            nodes = obj if isinstance(obj, list) else [obj]
-                            for node in nodes:
-                                if not isinstance(node, dict):
-                                    continue
-                                if node.get("@type") == "ItemList":
-                                    for el in node.get("itemListElement", []):
-                                        prod = el.get("item", el) if isinstance(el, dict) else {}
-                                        nombre = prod.get("name")
-                                        link   = prod.get("url")
-                                        offers = prod.get("offers", {})
-                                        if isinstance(offers, list):
-                                            offers = offers[0] if offers else {}
-                                        precio = _clean_price(offers.get("price")) if isinstance(offers, dict) else None
-                                        if nombre:
-                                            candidatos.append({"nombre": nombre, "link": link, "precio": precio})
-                                elif node.get("@type") == "Product":
-                                    nombre = node.get("name")
-                                    link   = node.get("url")
-                                    offers = node.get("offers", {})
-                                    if isinstance(offers, list):
-                                        offers = offers[0] if offers else {}
-                                    precio = _clean_price(offers.get("price")) if isinstance(offers, dict) else None
-                                    if nombre:
-                                        candidatos.append({"nombre": nombre, "link": link, "precio": precio})
-                        except Exception:
-                            continue
-
-                # Fallback: regex sobre precios y nombres en el HTML
-                if not candidatos:
-                    nombres_html = re.findall(r'"productName"\s*:\s*"([^"]+)"', html)
-                    precios_html = re.findall(r'"[Pp]rice"\s*:\s*([\d.]+)', html)
-                    links_html   = re.findall(r'"linkText"\s*:\s*"([^"]+)"', html)
-                    for idx, nom in enumerate(nombres_html[:8]):
-                        candidatos.append({
-                            "nombre": _html.unescape(nom),
-                            "link":   f"https://www.somosrex.com/{links_html[idx]}/p" if idx < len(links_html) else url_busqueda,
-                            "precio": _clean_price(precios_html[idx]) if idx < len(precios_html) else None,
-                        })
+            resp = scraper.get(url, timeout=20)
+            if resp.status_code != 200:
+                logger.warning("Rex HTTP %d para %s", resp.status_code, url)
+                continue
+            candidatos = _rex_candidatos_de_html(resp.text, url)
+            mejor = _elegir_mejor(candidatos, ref)
+            if mejor:
+                result.update(precio=mejor["precio"], url=mejor["link"],
+                              nombre=mejor["nombre"], intento=i, score=mejor["score"])
+                break
         except Exception as exc:
             logger.warning("Rex error intento %d: %s", i, exc)
-
-        # Fallback: HTML con __STATE__ embebido (VTEX render).
-        if not candidatos:
-            try:
-                url_html = f"https://www.somosrex.com/{q_enc}?map=ft"
-                resp = session.get(url_html, timeout=15,
-                                   headers={**session.headers, "Accept": HEADERS["Accept"]})
-                html = resp.text
-                # Nombres y precios sueltos del __STATE__.
-                nombres = re.findall(r'"productName"\s*:\s*"([^"]+)"', html)
-                precios = re.findall(r'"Price"\s*:\s*([\d.]+)', html)
-                links = re.findall(r'"linkText"\s*:\s*"([^"]+)"', html)
-                for idx, nom in enumerate(nombres[:8]):
-                    candidatos.append({
-                        "nombre": _html.unescape(nom),
-                        "link": (f"https://www.somosrex.com/{links[idx]}/p"
-                                 if idx < len(links) else url_html),
-                        "precio": _clean_price(precios[idx]) if idx < len(precios) else None,
-                    })
-            except Exception as exc:
-                logger.warning("Rex HTML fallback error: %s", exc)
-
-        mejor = _elegir_mejor(candidatos, ref)
-        if mejor:
-            result.update(precio=mejor["precio"], url=mejor["link"],
-                         nombre=mejor["nombre"], intento=i, score=mejor["score"])
-            break
 
     if result["precio"] is None and result["error"] is None:
         result["error"] = f"Sin resultados relevantes en Rex tras {len(queries)} intentos"
     return result
 
 
-# ── Sagitario (tienda estándar: WooCommerce / Tiendanube) ─────────────────────────
+# ── Sagitario — WooCommerce ────────────────────────────────────────────────────────
 def _sagitario_candidatos_de_html(html: str) -> list[dict]:
-    """
-    Extrae candidatos de la página de resultados de Sagitario.
-    Combina JSON-LD (ItemList/Product) con parsing de tarjetas de producto.
-    """
-    cands: list[dict] = []
+    cands = _candidatos_de_jsonld(html)
 
-    # 1) JSON-LD: puede traer ItemList con varios productos.
-    ld_blocks = re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
-    )
-    for blk in ld_blocks:
-        try:
-            obj = json.loads(blk.strip())
-        except Exception:
-            continue
-        nodes = obj if isinstance(obj, list) else obj.get("@graph", [obj])
-        for node in nodes if isinstance(nodes, list) else [nodes]:
-            if not isinstance(node, dict):
-                continue
-            t = node.get("@type")
-            if t == "ItemList":
-                for el in node.get("itemListElement", []):
-                    prod = el.get("item", el) if isinstance(el, dict) else {}
-                    _push_ld_product(prod, cands)
-            elif t == "Product" or (isinstance(t, list) and "Product" in t):
-                _push_ld_product(node, cands)
-
-    # 2) Parsing de tarjetas (WooCommerce <li class="product"> / Tiendanube).
+    # WooCommerce: <li class="...product...">
     if len(cands) < 2:
-        # WooCommerce: bloques <li class="...product..."> con <a href> y precio.
         for m in re.finditer(
             r'<li[^>]*class="[^"]*\bproduct\b[^"]*"[^>]*>(.*?)</li>',
             html, re.DOTALL | re.IGNORECASE,
         ):
             blk = m.group(1)
             href = re.search(r'<a[^>]+href="([^"]+)"', blk)
-            nom = re.search(r'<h2[^>]*>(.*?)</h2>', blk, re.DOTALL) \
-                or re.search(r'woocommerce-loop-product__title[^>]*>(.*?)<', blk, re.DOTALL)
-            price = re.search(r'class="[^"]*price[^"]*"[^>]*>.*?([\d.][\d.,]*)', blk, re.DOTALL)
+            nom  = (
+                re.search(r'woocommerce-loop-product__title[^>]*>(.*?)<', blk, re.DOTALL)
+                or re.search(r'<h2[^>]*>(.*?)</h2>', blk, re.DOTALL)
+            )
+            price = re.search(
+                r'class="[^"]*\bprice\b[^"]*"[^>]*>.*?([\d.][\d.,]*)',
+                blk, re.DOTALL,
+            )
             if href and nom:
-                cands.append({
-                    "nombre": re.sub(r"<[^>]+>", "", nom.group(1)).strip(),
-                    "link": _html.unescape(href.group(1)),
-                    "precio": _clean_price(price.group(1)) if price else None,
-                })
+                nombre = re.sub(r"<[^>]+>", "", nom.group(1)).strip()
+                if nombre:
+                    cands.append({
+                        "nombre": nombre,
+                        "link":   _html.unescape(href.group(1)),
+                        "precio": _clean_price(price.group(1)) if price else None,
+                    })
 
-    # 3) Tiendanube: links de producto en data-store o anchors a /productos/.
+    # Tiendanube fallback
     if not cands:
         for m in re.finditer(
             r'<a[^>]+href="([^"]*/(?:productos|product)/[^"]+)"[^>]*>(.*?)</a>',
@@ -493,57 +395,20 @@ def _sagitario_candidatos_de_html(html: str) -> list[dict]:
                     link = "https://pintureriasagitario.com.ar" + link
                 cands.append({"nombre": nombre, "link": _html.unescape(link), "precio": None})
 
-    # de-duplicar por link
-    vistos, unicos = set(), []
-    for c in cands:
-        k = c.get("link")
-        if k and k not in vistos:
-            vistos.add(k)
-            unicos.append(c)
-    return unicos
+    return _dedup_candidatos(cands)
 
 
-def _push_ld_product(node: dict, cands: list[dict]):
-    if not isinstance(node, dict):
-        return
-    nombre = node.get("name")
-    if not nombre:
-        return
-    link = node.get("url") or node.get("@id")
-    offers = node.get("offers", {})
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-    precio = _clean_price(offers.get("price") or offers.get("lowPrice")) if isinstance(offers, dict) else None
-    cands.append({"nombre": nombre, "link": link, "precio": precio})
-
-
-def _sagitario_precio_de_pagina(session, url: str) -> tuple[float | None, str | None]:
-    """Abre la página de producto y confirma precio + nombre."""
+def _sagitario_precio_de_pagina(scraper, url: str) -> tuple[float | None, str | None]:
     try:
-        r = session.get(url, timeout=12)
+        r = scraper.get(url, timeout=12)
         h = r.text
-        precio = None
-        nombre = None
-        # JSON-LD del producto.
-        for blk in re.findall(
-            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            h, re.DOTALL | re.IGNORECASE,
-        ):
-            try:
-                obj = json.loads(blk.strip())
-            except Exception:
-                continue
-            nodes = obj if isinstance(obj, list) else obj.get("@graph", [obj])
-            for node in nodes if isinstance(nodes, list) else [nodes]:
-                if isinstance(node, dict) and (node.get("@type") == "Product"
-                        or (isinstance(node.get("@type"), list) and "Product" in node["@type"])):
-                    nombre = node.get("name") or nombre
-                    offers = node.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    if isinstance(offers, dict):
-                        precio = _clean_price(offers.get("price") or offers.get("lowPrice")) or precio
-        # Fallbacks regex.
+        precio = nombre = None
+        cands = _candidatos_de_jsonld(h)
+        for c in cands:
+            if c.get("precio"):
+                precio = c["precio"]
+                nombre = c.get("nombre")
+                break
         if precio is None:
             m = re.search(r'"price"\s*:\s*["\']?([\d.,]+)', h)
             if m:
@@ -559,27 +424,23 @@ def _sagitario_precio_de_pagina(session, url: str) -> tuple[float | None, str | 
 
 
 def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """Busca en Sagitario, puntúa los candidatos y confirma en la ficha."""
     queries = _build_queries(detalle, marca, cod_proveedor)
-    result = _empty_result()
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    result  = _empty_result()
+    scraper = _make_scraper()
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
         try:
-            url_busqueda = (
+            url = (
                 "https://pintureriasagitario.com.ar/?"
                 + urllib.parse.urlencode({"s": query, "post_type": "product"})
             )
-            resp = session.get(url_busqueda, timeout=15)
+            resp = scraper.get(url, timeout=15)
             resp.raise_for_status()
             candidatos = _sagitario_candidatos_de_html(resp.text)
             if not candidatos:
                 continue
 
-            # Puntuar y ordenar; quedarnos con los mejores para confirmar precio.
             for c in candidatos:
                 c["score"] = score_similitud(ref, c["nombre"])
             candidatos.sort(key=lambda c: c["score"], reverse=True)
@@ -587,21 +448,21 @@ def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: 
             if not candidatos:
                 continue
 
-            # Confirmar precio del mejor candidato (visitando ficha si hace falta).
             elegido = None
             for c in candidatos[:3]:
                 precio = c.get("precio")
                 nombre = c.get("nombre")
                 if precio is None and c.get("link"):
-                    precio, nombre_pg = _sagitario_precio_de_pagina(session, c["link"])
+                    precio, nombre_pg = _sagitario_precio_de_pagina(scraper, c["link"])
                     nombre = nombre_pg or nombre
                 if precio:
-                    elegido = {"precio": precio, "link": c.get("link") or url_busqueda,
+                    elegido = {"precio": precio, "link": c.get("link") or url,
                                "nombre": nombre, "score": c["score"]}
                     break
+
             if elegido:
                 result.update(precio=elegido["precio"], url=elegido["link"],
-                             nombre=elegido["nombre"], intento=i, score=elegido["score"])
+                              nombre=elegido["nombre"], intento=i, score=elegido["score"])
                 break
 
         except Exception as exc:
@@ -612,94 +473,54 @@ def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: 
     return result
 
 
-# ── MercadoLibre (scraping HTML — la API anónima fue desactivada) ──────────────────
+# ── MercadoLibre ───────────────────────────────────────────────────────────────────
 def _ml_candidatos_de_html(html: str) -> list[dict]:
-    """Extrae candidatos del HTML de listado.mercadolibre.com.ar."""
-    cands: list[dict] = []
+    cands = _candidatos_de_jsonld(html)
 
-    # 1) JSON-LD ItemList (ML lo incluye en las páginas de resultados).
-    for blk in re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
-    ):
-        try:
-            obj = json.loads(blk.strip())
-        except Exception:
-            continue
-        nodes = obj if isinstance(obj, list) else [obj]
-        for node in nodes:
-            if isinstance(node, dict) and node.get("@type") == "ItemList":
-                for el in node.get("itemListElement", []):
-                    prod = el.get("item", {}) if isinstance(el, dict) else {}
-                    nombre = prod.get("name")
-                    link = prod.get("url") or (el.get("url") if isinstance(el, dict) else None)
-                    offers = prod.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    precio = _clean_price(offers.get("price")) if isinstance(offers, dict) else None
-                    if nombre:
-                        cands.append({"nombre": nombre, "link": link, "precio": precio})
-
-    # 2) Parsing de tarjetas de resultado (estructura ui-search-*).
-    #    Capturamos pares título/precio/link por bloque de resultado.
     if len(cands) < 3:
-        for blk in re.split(r'<li[^>]*class="[^"]*ui-search-layout__item[^"]*"', html)[1:]:
-            t = re.search(r'class="[^"]*ui-search-item__title[^"]*"[^>]*>(.*?)<', blk, re.DOTALL) \
+        for blk in re.split(
+            r'<li[^>]*class="[^"]*ui-search-layout__item[^"]*"', html
+        )[1:]:
+            t = (
+                re.search(r'class="[^"]*ui-search-item__title[^"]*"[^>]*>(.*?)<', blk, re.DOTALL)
                 or re.search(r'<h[23][^>]*>(.*?)</h[23]>', blk, re.DOTALL)
-            href = re.search(r'href="(https://[^"]*mercadolibre[^"]*)"', blk)
-            price = re.search(
-                r'andes-money-amount__fraction[^>]*>([\d.\s]+)<', blk
-            ) or re.search(r'price-tag-fraction[^>]*>([\d.\s]+)<', blk)
+            )
+            href  = re.search(r'href="(https://[^"]*mercadolibre[^"]*)"', blk)
+            price = (
+                re.search(r'andes-money-amount__fraction[^>]*>([\d.\s]+)<', blk)
+                or re.search(r'price-tag-fraction[^>]*>([\d.\s]+)<', blk)
+            )
             if t and href:
                 nombre = re.sub(r"<[^>]+>", "", t.group(1)).strip()
                 if nombre:
                     cands.append({
                         "nombre": _html.unescape(nombre),
-                        "link": href.group(1).split("#")[0],
+                        "link":   href.group(1).split("#")[0],
                         "precio": _clean_price(price.group(1)) if price else None,
                     })
 
-    # de-dup por nombre
-    vistos, unicos = set(), []
-    for c in cands:
-        k = (c.get("nombre") or "").lower()[:60]
-        if k and k not in vistos:
-            vistos.add(k)
-            unicos.append(c)
-    return unicos
+    return _dedup_candidatos(cands)
 
 
 def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """
-    Busca en MercadoLibre. Estrategia:
-    1. API oficial /sites/MLA/search (rápida, JSON limpio).
-    2. Si falla con 403, scrapea HTML de listado.mercadolibre.com.ar.
-    Usa query simplificada (máx 3 tokens) para mejor match.
-    """
     queries = _build_queries(detalle, marca, cod_proveedor)
-    result = _empty_result()
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    result  = _empty_result()
+    scraper = _make_scraper()
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        # Simplificar query a máx 3 tokens para ML (evita sobre-restricción)
-        toks_query = query.split()
-        query_corta = " ".join(toks_query[:3])
-
+        q_corta = " ".join(query.split()[:3])
         candidatos: list[dict] = []
 
-        # ── Intento A: API oficial ──────────────────────────────────────────────
+        # A) API oficial
         try:
             api_url = (
                 f"https://api.mercadolibre.com/sites/MLA/search"
-                f"?q={urllib.parse.quote(query_corta)}&limit=10"
+                f"?q={urllib.parse.quote(q_corta)}&limit=10"
             )
-            resp_api = session.get(api_url, timeout=12)
-            if resp_api.status_code == 200:
-                items_api = resp_api.json().get("results", [])
-                for prod in items_api[:10]:
+            resp = scraper.get(api_url, timeout=12)
+            if resp.status_code == 200:
+                for prod in resp.json().get("results", [])[:10]:
                     candidatos.append({
                         "nombre": prod.get("title"),
                         "link":   prod.get("permalink"),
@@ -708,48 +529,46 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
         except Exception as exc:
             logger.warning("ML API error: %s", exc)
 
-        # ── Intento B: página de búsqueda estándar de ML ──────────────────────
+        # B) Página de búsqueda HTML
         if not candidatos:
             try:
-                # URL de búsqueda pública de ML Argentina
-                url_search = f"https://www.mercadolibre.com.ar/search?q={urllib.parse.quote(query_corta)}&sort=relevance_v2"
-                resp_html = session.get(url_search, timeout=15)
-                if resp_html.status_code == 200 and "suspicious-traffic" not in resp_html.url:
-                    candidatos = _ml_candidatos_de_html(resp_html.text)
+                url_s = (
+                    f"https://www.mercadolibre.com.ar/search"
+                    f"?q={urllib.parse.quote(q_corta)}&sort=relevance_v2"
+                )
+                resp = scraper.get(url_s, timeout=15)
+                if resp.status_code == 200 and "suspicious-traffic" not in resp.url:
+                    candidatos = _ml_candidatos_de_html(resp.text)
             except Exception as exc:
                 logger.warning("ML search page error: %s", exc)
 
-        # ── Intento C: listado con slug ────────────────────────────────────────
+        # C) Listado con slug
         if not candidatos:
             try:
-                slug = re.sub(r"\s+", "-", query_corta.strip().lower())
-                url_html = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
-                resp_html = session.get(url_html, timeout=15)
-                if resp_html.status_code == 200 and "suspicious-traffic" not in resp_html.url:
-                    candidatos = _ml_candidatos_de_html(resp_html.text)
+                slug = re.sub(r"\s+", "-", q_corta.strip().lower())
+                url_l = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
+                resp  = scraper.get(url_l, timeout=15)
+                if resp.status_code == 200 and "suspicious-traffic" not in resp.url:
+                    candidatos = _ml_candidatos_de_html(resp.text)
             except Exception as exc:
-                logger.warning("ML HTML error: %s", exc)
+                logger.warning("ML listado error: %s", exc)
 
         if not candidatos:
             continue
 
-        # Puntuar y filtrar
         for c in candidatos:
             c["score"] = score_similitud(ref, c.get("nombre") or "")
         candidatos.sort(key=lambda c: c["score"], reverse=True)
         relevantes = [c for c in candidatos if c["score"] >= SCORE_MIN and c.get("precio")]
-
         if not relevantes:
             continue
 
-        # Mediana de precios (evita outliers de combos/lotes)
         top = relevantes[:5]
         precios = sorted(c["precio"] for c in top)
         mediana = precios[len(precios) // 2]
-        mejor = top[0]
-
+        mejor   = top[0]
         result.update(precio=mediana, url=mejor.get("link"),
-                     nombre=mejor.get("nombre"), intento=i, score=mejor["score"])
+                      nombre=mejor.get("nombre"), intento=i, score=mejor["score"])
         break
 
     if result["precio"] is None and result["error"] is None:
@@ -757,40 +576,237 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
     return result
 
 
-# ── Selección del mejor candidato (genérico) ──────────────────────────────────────
-def _elegir_mejor(candidatos: list[dict], ref: str) -> dict | None:
-    """
-    De una lista [{nombre, link, precio}], puntúa cada uno vs `ref` y devuelve
-    el de mayor score que tenga precio, siempre que supere SCORE_MIN.
-    """
-    if not candidatos:
-        return None
-    for c in candidatos:
-        c["score"] = score_similitud(ref, c.get("nombre", ""))
-    candidatos.sort(key=lambda c: c["score"], reverse=True)
-    for c in candidatos:
-        if c["score"] >= SCORE_MIN and c.get("precio"):
-            return c
-    # Si el mejor supera el umbral pero no trae precio, igual lo reportamos sin precio
-    mejor = candidatos[0]
-    if mejor["score"] >= SCORE_MIN:
-        return mejor if mejor.get("precio") else None
-    return None
+# ── Sodimac ────────────────────────────────────────────────────────────────────────
+def _sodimac_candidatos_de_html(html: str) -> list[dict]:
+    cands = _candidatos_de_jsonld(html)
+
+    # Sodimac embebe datos en window.__PRELOADED_STATE__ o similar JSON en script
+    if not cands:
+        for pat in (
+            r'window\.__INITIAL_STATE__\s*=\s*({.+?});\s*(?:</script>|window\.)',
+            r'window\.__PRELOADED_STATE__\s*=\s*({.+?});\s*(?:</script>|window\.)',
+            r'"products"\s*:\s*(\[.+?\])\s*,?\s*"',
+        ):
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    # Buscar lista de productos en diferentes paths del state
+                    prods = []
+                    if isinstance(data, list):
+                        prods = data
+                    elif isinstance(data, dict):
+                        prods = (
+                            data.get("search", {}).get("results", [])
+                            or data.get("results", [])
+                            or data.get("products", [])
+                        )
+                    for prod in prods[:8]:
+                        if not isinstance(prod, dict):
+                            continue
+                        nombre = (
+                            prod.get("displayName") or prod.get("name")
+                            or prod.get("productName") or prod.get("title")
+                        )
+                        precio = _clean_price(
+                            prod.get("currentPrice") or prod.get("price")
+                            or prod.get("regularPrice") or prod.get("normalPrice")
+                        )
+                        link = prod.get("url") or prod.get("productUrl") or prod.get("slug")
+                        if nombre:
+                            if link and not link.startswith("http"):
+                                link = "https://www.sodimac.com.ar" + link
+                            cands.append({"nombre": nombre, "link": link, "precio": precio})
+                except Exception:
+                    continue
+            if cands:
+                break
+
+    # Fallback: tarjetas HTML genéricas
+    if not cands:
+        for blk in re.split(
+            r'<(?:div|article|li)[^>]+class="[^"]*(?:product|item|card)[^"]*"',
+            html
+        )[1:]:
+            href = re.search(r'href="([^"]+)"', blk)
+            nom  = re.search(r'<h[23][^>]*>(.*?)</h[23]>', blk, re.DOTALL)
+            price = re.search(r'(?:finalPrice|currentPrice|price)["\s:]+[\$\s]*([\d.,]+)', blk)
+            if href and nom:
+                nombre = re.sub(r"<[^>]+>", "", nom.group(1)).strip()
+                link = href.group(1)
+                if not link.startswith("http"):
+                    link = "https://www.sodimac.com.ar" + link
+                if nombre:
+                    cands.append({
+                        "nombre": nombre,
+                        "link":   link,
+                        "precio": _clean_price(price.group(1)) if price else None,
+                    })
+
+    return _dedup_candidatos(cands)
 
 
-# ── Función principal ─────────────────────────────────────────────────────────────
+def scrape_sodimac(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+    """Busca en Sodimac Argentina."""
+    queries = _build_queries(detalle, marca, cod_proveedor)
+    result  = _empty_result()
+    scraper = _make_scraper()
+
+    for i, item in enumerate(queries, start=1):
+        query, ref = item["q"], item["ref"]
+        q_corta = " ".join(query.split()[:5])
+        q_enc   = urllib.parse.quote(q_corta)
+        candidatos: list[dict] = []
+
+        for url in [
+            f"https://www.sodimac.com.ar/sodimac-ar/search?Ntt={q_enc}",
+            f"https://www.sodimac.com.ar/sodimac-ar/search?q={q_enc}",
+        ]:
+            try:
+                resp = scraper.get(url, timeout=20)
+                if resp.status_code == 200:
+                    candidatos = _sodimac_candidatos_de_html(resp.text)
+                    if candidatos:
+                        break
+            except Exception as exc:
+                logger.warning("Sodimac %s error: %s", url, exc)
+
+        mejor = _elegir_mejor(candidatos, ref)
+        if mejor:
+            result.update(precio=mejor["precio"], url=mejor["link"],
+                          nombre=mejor["nombre"], intento=i, score=mejor["score"])
+            break
+
+    if result["precio"] is None and result["error"] is None:
+        result["error"] = f"Sin resultados relevantes en Sodimac tras {len(queries)} intentos"
+    return result
+
+
+# ── Easy ───────────────────────────────────────────────────────────────────────────
+def _easy_candidatos_de_html(html: str) -> list[dict]:
+    cands = _candidatos_de_jsonld(html)
+
+    # Easy Argentina puede embeber datos como JSON en script o usar Vtex/propio
+    if not cands:
+        for pat in (
+            r'window\.__INITIAL_STATE__\s*=\s*({.+?});\s*(?:</script>|window\.)',
+            r'__STATE__\s*=\s*({.+?});\s*</script>',
+            r'"products"\s*:\s*(\[.+?\])\s*,',
+        ):
+            for m in re.finditer(pat, html, re.DOTALL):
+                try:
+                    data = json.loads(m.group(1))
+                    prods = []
+                    if isinstance(data, list):
+                        prods = data
+                    elif isinstance(data, dict):
+                        prods = (
+                            data.get("search", {}).get("results", [])
+                            or data.get("products", [])
+                            or data.get("results", [])
+                        )
+                    for prod in prods[:8]:
+                        if not isinstance(prod, dict):
+                            continue
+                        nombre = (
+                            prod.get("productName") or prod.get("name")
+                            or prod.get("title") or prod.get("displayName")
+                        )
+                        precio = _clean_price(
+                            prod.get("price") or prod.get("currentPrice")
+                            or prod.get("regularPrice") or prod.get("listPrice")
+                        )
+                        link = prod.get("url") or prod.get("linkText")
+                        if nombre:
+                            if link and not link.startswith("http"):
+                                if "/" not in link:
+                                    link = f"https://www.easy.com.ar/{link}/p"
+                                else:
+                                    link = "https://www.easy.com.ar" + link
+                            cands.append({"nombre": nombre, "link": link, "precio": precio})
+                except Exception:
+                    continue
+            if cands:
+                break
+
+    # Fallback: tarjetas HTML y regex de precio
+    if not cands:
+        for blk in re.split(
+            r'<(?:div|article|li)[^>]+class="[^"]*(?:product|item|result)[^"]*"',
+            html
+        )[1:]:
+            href = re.search(r'href="([^"]+)"', blk)
+            nom  = re.search(r'<h[23][^>]*>(.*?)</h[23]>', blk, re.DOTALL)
+            price = re.search(r'[\$\$]?\s*([\d.,]{4,})', blk)
+            if href and nom:
+                nombre = re.sub(r"<[^>]+>", "", nom.group(1)).strip()
+                link = href.group(1)
+                if not link.startswith("http"):
+                    link = "https://www.easy.com.ar" + link
+                if nombre:
+                    cands.append({
+                        "nombre": nombre,
+                        "link":   link,
+                        "precio": _clean_price(price.group(1)) if price else None,
+                    })
+
+    return _dedup_candidatos(cands)
+
+
+def scrape_easy(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+    """Busca en Easy Argentina."""
+    queries = _build_queries(detalle, marca, cod_proveedor)
+    result  = _empty_result()
+    scraper = _make_scraper()
+
+    for i, item in enumerate(queries, start=1):
+        query, ref = item["q"], item["ref"]
+        q_corta = " ".join(query.split()[:5])
+        q_enc   = urllib.parse.quote(q_corta)
+        candidatos: list[dict] = []
+
+        for url in [
+            f"https://www.easy.com.ar/search?q={q_enc}",
+            f"https://www.easy.com.ar/search?term={q_enc}",
+        ]:
+            try:
+                resp = scraper.get(url, timeout=20)
+                if resp.status_code == 200:
+                    candidatos = _easy_candidatos_de_html(resp.text)
+                    if candidatos:
+                        break
+            except Exception as exc:
+                logger.warning("Easy %s error: %s", url, exc)
+
+        mejor = _elegir_mejor(candidatos, ref)
+        if mejor:
+            result.update(precio=mejor["precio"], url=mejor["link"],
+                          nombre=mejor["nombre"], intento=i, score=mejor["score"])
+            break
+
+    if result["precio"] is None and result["error"] is None:
+        result["error"] = f"Sin resultados relevantes en Easy tras {len(queries)} intentos"
+    return result
+
+
+# ── Orquestador principal ──────────────────────────────────────────────────────────
 def buscar_precios(detalle: str, marca: str,
                    cod_proveedor=None,
                    nombre_proveedor: str = "") -> dict[str, dict]:
-    """Ejecuta los 3 scrapers en paralelo."""
+    """Ejecuta los 5 scrapers en paralelo y devuelve resultados indexados por nombre."""
     args = (detalle, marca, cod_proveedor, nombre_proveedor)
-    scrapers = {"rex": scrape_rex, "sagitario": scrape_sagitario, "ml": scrape_ml}
+    scrapers = {
+        "rex":      scrape_rex,
+        "sagitario": scrape_sagitario,
+        "ml":       scrape_ml,
+        "sodimac":  scrape_sodimac,
+        "easy":     scrape_easy,
+    }
     resultados: dict[str, dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
         futures = {name: ex.submit(fn, *args) for name, fn in scrapers.items()}
         for name, fut in futures.items():
             try:
-                resultados[name] = fut.result(timeout=35)
+                resultados[name] = fut.result(timeout=40)
             except Exception as exc:
                 r = _empty_result()
                 r["error"] = str(exc)
