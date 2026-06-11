@@ -61,8 +61,9 @@ HEADERS = {
 }
 
 # Score mínimo para aceptar un candidato como "el mismo producto".
-# Por debajo de esto se descarta para evitar falsos positivos.
-SCORE_MIN = 0.34
+# "Buzo Coronados" vs "RECUP TECHOS" = 0.023 → descartado.
+# "Membrana Recuplast Techos 20kg" vs "RECUP TECHOS 20 KGS" = ~0.75 → aceptado.
+SCORE_MIN = 0.20
 
 # Palabras de relleno que no aportan a la identificación del producto.
 _STOPWORDS = {
@@ -614,8 +615,10 @@ def _ml_candidatos_de_html(html: str) -> list[dict]:
 
 def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    Scrapea el HTML público de MercadoLibre (la API /sites/MLA/search anónima
-    devuelve 403 desde 2024/2025). Usa queries comerciales simplificadas.
+    Busca en MercadoLibre. Estrategia:
+    1. API oficial /sites/MLA/search (rápida, JSON limpio).
+    2. Si falla con 403, scrapea HTML de listado.mercadolibre.com.ar.
+    Usa query simplificada (máx 3 tokens) para mejor match.
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result = _empty_result()
@@ -625,36 +628,62 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
+        # Simplificar query a máx 3 tokens para ML (evita sobre-restricción)
+        toks_query = query.split()
+        query_corta = " ".join(toks_query[:3])
+
+        candidatos: list[dict] = []
+
+        # ── Intento A: API oficial ──────────────────────────────────────────────
         try:
-            # ML usa guiones en el path: "recuplast techos blanco" -> "recuplast-techos-blanco"
-            slug = re.sub(r"\s+", "-", query.strip())
-            url = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
-            resp = session.get(url, timeout=15)
-            if resp.status_code != 200:
-                continue
-            candidatos = _ml_candidatos_de_html(resp.text)
-            if not candidatos:
-                continue
-
-            for c in candidatos:
-                c["score"] = score_similitud(ref, c["nombre"])
-            candidatos.sort(key=lambda c: c["score"], reverse=True)
-            relevantes = [c for c in candidatos if c["score"] >= SCORE_MIN and c.get("precio")]
-            if not relevantes:
-                continue
-
-            # Precio: mediana de los relevantes top (evita outliers tipo combos/lotes).
-            top = relevantes[:5]
-            precios = sorted(c["precio"] for c in top)
-            mediana = precios[len(precios) // 2]
-            mejor = top[0]
-
-            result.update(precio=mediana, url=mejor.get("link"),
-                         nombre=mejor.get("nombre"), intento=i, score=mejor["score"])
-            break
-
+            api_url = (
+                f"https://api.mercadolibre.com/sites/MLA/search"
+                f"?q={urllib.parse.quote(query_corta)}&limit=10"
+            )
+            resp_api = session.get(api_url, timeout=12)
+            if resp_api.status_code == 200:
+                items_api = resp_api.json().get("results", [])
+                for prod in items_api[:10]:
+                    candidatos.append({
+                        "nombre": prod.get("title"),
+                        "link":   prod.get("permalink"),
+                        "precio": _clean_price(prod.get("price")),
+                    })
         except Exception as exc:
-            logger.warning("ML error intento %d: %s", i, exc)
+            logger.warning("ML API error: %s", exc)
+
+        # ── Intento B: HTML de listado (si API no devolvió nada) ───────────────
+        if not candidatos:
+            try:
+                slug = re.sub(r"\s+", "-", query_corta.strip().lower())
+                url_html = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
+                resp_html = session.get(url_html, timeout=15)
+                if resp_html.status_code == 200:
+                    candidatos = _ml_candidatos_de_html(resp_html.text)
+            except Exception as exc:
+                logger.warning("ML HTML error: %s", exc)
+
+        if not candidatos:
+            continue
+
+        # Puntuar y filtrar
+        for c in candidatos:
+            c["score"] = score_similitud(ref, c.get("nombre") or "")
+        candidatos.sort(key=lambda c: c["score"], reverse=True)
+        relevantes = [c for c in candidatos if c["score"] >= SCORE_MIN and c.get("precio")]
+
+        if not relevantes:
+            continue
+
+        # Mediana de precios (evita outliers de combos/lotes)
+        top = relevantes[:5]
+        precios = sorted(c["precio"] for c in top)
+        mediana = precios[len(precios) // 2]
+        mejor = top[0]
+
+        result.update(precio=mediana, url=mejor.get("link"),
+                     nombre=mejor.get("nombre"), intento=i, score=mejor["score"])
+        break
 
     if result["precio"] is None and result["error"] is None:
         result["error"] = f"Sin resultados relevantes en ML tras {len(queries)} intentos"
