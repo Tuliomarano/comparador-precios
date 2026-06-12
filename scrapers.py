@@ -1,12 +1,17 @@
 """
 scrapers.py — Búsqueda de precios en Rex, Sagitario, ML, Sodimac y Easy.
 
-Tecnologías detectadas (jun 2026):
-  Rex        → somosrex.com              → Magento 2 (CSR/React) → GraphQL POST + REST fallback
-  Sagitario  → pintureriasagitario.com.ar→ WooCommerce SSR       → HTML parser (<ins><bdi>)
-  ML         → api.mercadolibre.com      → API pública + HTML     → API + listado fallback
-  Sodimac    → sodimac.com.ar            → VTEX/CSR              → Intelligent Search API
-  Easy       → easy.com.ar              → VTEX CSR              → Catalog API JSON (PROBADO ✓)
+Enfoque "humano": cada scraper primero visita la homepage del sitio para
+establecer cookies y sesión (igual que haría un navegador real), y recién
+después realiza la búsqueda. Esto evita que los sistemas anti-bot bloqueen
+las requests "frías" directas a URLs de búsqueda.
+
+Tecnologías (jun 2026):
+  Rex        → somosrex.com               → Magento 2 GraphQL + REST
+  Sagitario  → pintureriasagitario.com.ar → WooCommerce SSR (parser posicional)
+  ML         → mercadolibre.com.ar        → API + HTML (warmup sesión)
+  Sodimac    → sodimac.com.ar             → VTEX Catalog API (warmup sesión)
+  Easy       → easy.com.ar               → VTEX Catalog API (warmup sesión, confirmado ✓)
 """
 
 import re
@@ -27,21 +32,49 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "es-AR,es;q=0.9,es-419;q=0.8",
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
+# ── Headers base ──────────────────────────────────────────────────────────────
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_SEC_CH = (
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
+)
+
+# Como cuando una persona navega a una página web
+HEADERS_NAV = {
+    "User-Agent":               _UA,
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language":          "es-AR,es;q=0.9,es-419;q=0.8",
+    "Accept-Encoding":          "gzip, deflate, br",
+    "Sec-Ch-Ua":                _SEC_CH,
+    "Sec-Ch-Ua-Mobile":         "?0",
+    "Sec-Ch-Ua-Platform":       '"Windows"',
+    "Sec-Fetch-Dest":           "document",
+    "Sec-Fetch-Mode":           "navigate",
+    "Sec-Fetch-User":           "?1",
+    "Upgrade-Insecure-Requests":"1",
+    "Connection":               "keep-alive",
 }
+
+# Como cuando el JS del navegador llama a una API (XHR/Fetch)
+HEADERS_API = {
+    "User-Agent":       _UA,
+    "Accept":           "application/json, text/plain, */*",
+    "Accept-Language":  "es-AR,es;q=0.9",
+    "Accept-Encoding":  "gzip, deflate, br",
+    "Sec-Ch-Ua":        _SEC_CH,
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest":   "empty",
+    "Sec-Fetch-Mode":   "cors",
+    "Sec-Fetch-Site":   "same-origin",
+    "Connection":       "keep-alive",
+}
+
+# Compatibilidad retroactiva para código que usa HEADERS
+HEADERS = HEADERS_NAV
 
 SCORE_MIN = 0.20
 
@@ -69,23 +102,49 @@ _SINONIMOS = {
 }
 
 
-# ── Session factory ───────────────────────────────────────────────────────────────
+# ── Session factory ───────────────────────────────────────────────────────────
 def _make_scraper():
     """cloudscraper con bypass de Cloudflare; fallback a requests.Session."""
     if _HAS_CLOUDSCRAPER:
         sc = _cs_mod.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
-        sc.headers.update(HEADERS)
+        sc.headers.update(HEADERS_NAV)
         return sc
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update(HEADERS_NAV)
     return s
 
 
-# ── Helpers de precio y texto ─────────────────────────────────────────────────────
+def _warm_session(scraper, base_url: str, referer: str = "https://www.google.com.ar/",
+                  timeout: int = 10) -> bool:
+    """
+    Visita la homepage del sitio para establecer cookies y sesión.
+    Un humano hace esto antes de buscar — el servidor reconoce la sesión
+    y no bloquea las requests posteriores como si fueran bots.
+    Devuelve True si el calentamiento fue exitoso.
+    """
+    try:
+        r = scraper.get(
+            base_url,
+            headers={
+                **HEADERS_NAV,
+                "Referer": referer,
+                "Sec-Fetch-Site": "cross-site",
+            },
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        logger.debug("Warmup %s → HTTP %d", base_url, r.status_code)
+        return r.status_code < 400
+    except Exception as exc:
+        logger.warning("Warmup fallido %s: %s", base_url, exc)
+        return False
+
+
+# ── Helpers de precio y texto ─────────────────────────────────────────────────
 def _clean_price(value) -> float | None:
-    """Convierte string de precio AR (1.234,56) a float."""
+    """Convierte string de precio AR (1.234,56) o float/int a float."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -155,7 +214,7 @@ def score_similitud(buscado: str, encontrado: str) -> float:
     return round(min(1.0, 0.60 * cobertura + 0.25 * match_num + 0.15 * fuzzy), 3)
 
 
-# ── Construcción de queries ───────────────────────────────────────────────────────
+# ── Construcción de queries ───────────────────────────────────────────────────
 def _cod_str(cod_proveedor) -> str | None:
     if cod_proveedor in (None, "", "nan", "None"):
         return None
@@ -220,7 +279,7 @@ def _elegir_mejor(candidatos: list[dict], ref: str) -> dict | None:
     return mejor if mejor["score"] >= SCORE_MIN and mejor.get("precio") else None
 
 
-# ── Extractor JSON-LD genérico ────────────────────────────────────────────────────
+# ── Extractor JSON-LD genérico ────────────────────────────────────────────────
 def _push_ld_product(node: dict, cands: list[dict]):
     if not isinstance(node, dict):
         return
@@ -265,100 +324,131 @@ def _candidatos_de_jsonld(html: str) -> list[dict]:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SAGITARIO — WooCommerce SSR (confirmado: devuelve HTML completo)
+# SAGITARIO — WooCommerce SSR
 # ════════════════════════════════════════════════════════════════════════════════
-def _woo_precio_de_bloque(blk: str) -> float | None:
-    """
-    Extrae el precio actual de un bloque de tarjeta WooCommerce.
-    En WooCommerce: <del> = precio tachado, <ins> = precio de oferta.
-    Si no hay oferta, el precio está en <bdi> sin <del>/<ins>.
-    """
-    # 1) Precio de oferta → dentro de <ins>
-    ins_m = re.search(r"<ins[^>]*>(.*?)</ins>", blk, re.DOTALL | re.IGNORECASE)
-    if ins_m:
-        bdi_m = re.search(r"<bdi[^>]*>(.*?)</bdi>", ins_m.group(1), re.DOTALL | re.IGNORECASE)
-        if bdi_m:
-            text = re.sub(r"<[^>]+>", "", bdi_m.group(1))
-            precio = _clean_price(text)
-            if precio and precio > 100:
-                return precio
-
-    # 2) Precio regular (sin descuento): primer <bdi> fuera de <del>
-    blk_sin_del = re.sub(r"<del[^>]*>.*?</del>", "", blk, flags=re.DOTALL | re.IGNORECASE)
-    bdi_m = re.search(r"<bdi[^>]*>(.*?)</bdi>", blk_sin_del, re.DOTALL | re.IGNORECASE)
-    if bdi_m:
-        text = re.sub(r"<[^>]+>", "", bdi_m.group(1))
-        precio = _clean_price(text)
-        if precio and precio > 100:
-            return precio
-
-    # 3) Fallback: el precio literal en formato AR "$ 154.287,00" que WooCommerce repite
-    #    como texto accesible ("El precio actual es: $ 154.287,00")
-    m = re.search(r"El precio actual es:.*?\$\s*([\d.,]+)", blk, re.DOTALL)
-    if m:
-        return _clean_price(m.group(1))
-
-    return None
-
 
 def _sagitario_candidatos_de_html(html: str) -> list[dict]:
+    """
+    Parser posicional para WooCommerce.
+
+    PROBLEMA DEL PARSER ANTERIOR: usaba <li>(.*?)</li> con re.DOTALL,
+    que es "lazy" y se detiene en el primer </li> anidado dentro de la card,
+    cortando el bloque antes de llegar al precio.
+
+    NUEVA ESTRATEGIA: no delimitamos por </li>. En cambio:
+      1. Encontramos todos los headings de producto (h2/h6 con link a /producto/)
+      2. Encontramos todos los precios en el HTML (patrón "El precio actual es:")
+      3. Unimos heading ↔ precio más cercano por posición en el documento
+         (igual que haría una persona leyendo la página de arriba a abajo)
+    """
     cands: list[dict] = []
 
-    # WooCommerce product cards: <li class="...product...">
+    # ── Paso 1: encontrar todos los headings de producto con su URL ──────────
+    # WooCommerce pone el nombre del producto en un heading con clase
+    # "woocommerce-loop-product__title", que contiene un <a href="/producto/...">
+    headings: list[tuple[int, str, str]] = []  # (pos, url, nombre)
+
+    # Patrón A: heading con clase WooCommerce explícita
     for m in re.finditer(
-        r"<li[^>]+class=\"[^\"]*\bproduct\b[^\"]*\"[^>]*>(.*?)</li>",
+        r'woocommerce-loop-product__title[^>]*>.*?'
+        r'<a\s[^>]*href="(https://pintureriasagitario\.com\.ar/producto/[^"]+)"[^>]*>'
+        r'(.*?)</a>',
         html, re.DOTALL | re.IGNORECASE,
     ):
-        blk = m.group(1)
+        nombre = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        if nombre:
+            headings.append((m.start(), m.group(1), nombre))
 
-        # URL: primer href apuntando a /producto/
-        href_m = re.search(
-            r'href="(https://pintureriasagitario\.com\.ar/producto/[^"]+)"', blk
-        )
-        if not href_m:
-            href_m = re.search(r'href="(/producto/[^"]+)"', blk)
-
-        # Nombre: h2 con clase woocommerce-loop-product__title
-        nom_m = re.search(
-            r"woocommerce-loop-product__title[^>]*>(.*?)</h[1-6]>",
-            blk, re.DOTALL | re.IGNORECASE,
-        )
-        if not nom_m:
-            nom_m = re.search(r"<h[1-6][^>]*>(.*?)</h[1-6]>", blk, re.DOTALL)
-
-        if not nom_m:
-            continue
-
-        nombre = re.sub(r"<[^>]+>", "", nom_m.group(1)).strip()
-        if not nombre:
-            continue
-
-        link = href_m.group(1) if href_m else None
-        if link and link.startswith("/"):
-            link = "https://pintureriasagitario.com.ar" + link
-
-        precio = _woo_precio_de_bloque(blk)
-        cands.append({"nombre": nombre, "link": link, "precio": precio})
-
-    # Si los <li> no matchean: fallback por links a /producto/ con precio cercano
-    if not cands:
-        # Buscar todos los anchors a /producto/ con su nombre
+    # Patrón B: cualquier heading h2/h6 que contenga un link a /producto/
+    if not headings:
         for m in re.finditer(
-            r'href="(https://pintureriasagitario\.com\.ar/producto/[^"]+)"[^>]*>(.*?)</a>',
+            r'<h[1-6][^>]*>.*?'
+            r'<a\s[^>]*href="(https://pintureriasagitario\.com\.ar/producto/[^"]+)"[^>]*>'
+            r'(.*?)</a>.*?</h[1-6]>',
             html, re.DOTALL | re.IGNORECASE,
         ):
-            nombre = re.sub(r"<[^>]+>", " ", m.group(2)).strip()
-            nombre = re.sub(r"\s+", " ", nombre)
-            if len(nombre) > 5:
-                cands.append({"nombre": nombre, "link": m.group(1), "precio": None})
+            nombre = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if nombre:
+                headings.append((m.start(), m.group(1), nombre))
+
+    if not headings:
+        logger.warning("Sagitario: no se encontraron headings de producto")
+        return []
+
+    # ── Paso 2: encontrar todos los precios con su posición ──────────────────
+
+    # A) Texto accesible WooCommerce: "El precio actual es: $ 154.287,00."
+    #    Este es el patrón más confiable porque es texto literal, no HTML.
+    precios_actuales: list[tuple[int, float]] = []  # (pos, precio)
+    for m in re.finditer(
+        r'El precio actual es:.*?\$\s*([\d.,]+)', html, re.DOTALL
+    ):
+        p = _clean_price(m.group(1))
+        if p and p > 100:
+            precios_actuales.append((m.start(), p))
+
+    # B) Precio de oferta: dentro de <ins>...<bdi>PRECIO</bdi>...</ins>
+    precios_ins: list[tuple[int, float]] = []
+    for m in re.finditer(
+        r'<ins[^>]*>.*?<bdi[^>]*>(.*?)</bdi>.*?</ins>',
+        html, re.DOTALL | re.IGNORECASE,
+    ):
+        text = re.sub(r"<[^>]+>", "", m.group(1))
+        p = _clean_price(text)
+        if p and p > 100:
+            precios_ins.append((m.start(), p))
+
+    # C) Fallback: cualquier <bdi> fuera de <del>
+    #    (para productos sin descuento, el precio está en <bdi> sin <ins>/<del>)
+    html_sin_del = re.sub(r"<del[^>]*>.*?</del>", "", html,
+                          flags=re.DOTALL | re.IGNORECASE)
+    precios_bdi: list[tuple[int, float]] = []
+    for m in re.finditer(
+        r'<bdi[^>]*>(.*?)</bdi>', html_sin_del, re.DOTALL | re.IGNORECASE
+    ):
+        text = re.sub(r"<[^>]+>", "", m.group(1))
+        p = _clean_price(text)
+        if p and p > 100:
+            precios_bdi.append((m.start(), p))
+
+    # ── Paso 3: para cada heading, tomar el primer precio que aparece después ─
+    # (un humano leería de arriba hacia abajo y asociaría el precio con el
+    #  nombre que está justo arriba de él en la grilla)
+    for i, (hpos, url, nombre) in enumerate(headings):
+        # El rango es desde este heading hasta el próximo heading
+        next_pos = headings[i + 1][0] if i + 1 < len(headings) else len(html)
+
+        precio = None
+
+        # Intentar con "El precio actual es:" primero (más preciso)
+        for ppos, p in precios_actuales:
+            if hpos <= ppos < next_pos:
+                precio = p
+                break
+
+        # Si no: intentar con <ins>
+        if precio is None:
+            for ppos, p in precios_ins:
+                if hpos <= ppos < next_pos:
+                    precio = p
+                    break
+
+        # Si no: intentar con <bdi> genérico
+        if precio is None:
+            for ppos, p in precios_bdi:
+                if hpos <= ppos < next_pos:
+                    precio = p
+                    break
+
+        cands.append({"nombre": nombre, "link": url, "precio": precio})
 
     return _dedup_candidatos(cands)
 
 
 def _sagitario_precio_de_pagina(scraper, url: str) -> tuple[float | None, str | None]:
-    """Visita la ficha del producto y extrae precio + nombre."""
+    """Visita la ficha del producto y extrae precio + nombre (fallback)."""
     try:
-        r = scraper.get(url, timeout=12)
+        r = scraper.get(url, headers=HEADERS_NAV, timeout=12)
         h = r.text
 
         # JSON-LD del producto individual
@@ -385,21 +475,49 @@ def _sagitario_precio_de_pagina(scraper, url: str) -> tuple[float | None, str | 
 
 
 def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """WooCommerce SSR — parsea el HTML de resultados de búsqueda."""
+    """
+    WooCommerce SSR — como un humano:
+    1. Visita la homepage (establece cookies/sesión Cloudflare + WordPress)
+    2. Realiza la búsqueda con las cookies ya establecidas
+    3. Parsea el HTML usando posición (no límites de </li>)
+    """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
     scraper = _make_scraper()
 
+    # ── Paso humano 1: visitar homepage como si vinieras de Google ────────────
+    _warm_session(
+        scraper,
+        "https://pintureriasagitario.com.ar/",
+        referer="https://www.google.com.ar/search?q=pintureria+sagitario+argentina",
+    )
+
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
         try:
+            # ── Paso humano 2: buscar con Referer del mismo sitio ─────────────
             url = (
                 "https://pintureriasagitario.com.ar/?"
                 + urllib.parse.urlencode({"s": query, "post_type": "product"})
             )
-            resp = scraper.get(url, timeout=20)
+            resp = scraper.get(
+                url, timeout=20,
+                headers={
+                    **HEADERS_NAV,
+                    "Referer": "https://pintureriasagitario.com.ar/",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+            )
+
             if resp.status_code != 200:
-                logger.warning("Sagitario HTTP %d", resp.status_code)
+                result["error"] = f"Sagitario HTTP {resp.status_code}"
+                logger.warning("Sagitario HTTP %d para '%s'", resp.status_code, query)
+                continue
+
+            # Detectar página de bloqueo / captcha
+            if "suspicious" in resp.url or "captcha" in resp.text.lower():
+                result["error"] = "Sagitario: bloqueado por anti-bot"
+                logger.warning("Sagitario: posible captcha/bloqueo")
                 continue
 
             candidatos = _sagitario_candidatos_de_html(resp.text)
@@ -407,17 +525,20 @@ def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: 
                 logger.warning("Sagitario: 0 candidatos para '%s'", query)
                 continue
 
-            # Score y filtrado
+            # Scoring
             for c in candidatos:
                 c["score"] = score_similitud(ref, c["nombre"])
             candidatos.sort(key=lambda c: c["score"], reverse=True)
             relevantes = [c for c in candidatos if c["score"] >= SCORE_MIN]
 
             if not relevantes:
-                logger.warning("Sagitario: scores insuficientes (mejor %.2f)", candidatos[0]["score"])
+                logger.warning(
+                    "Sagitario: score insuficiente (mejor %.2f para '%s')",
+                    candidatos[0]["score"], candidatos[0]["nombre"]
+                )
                 continue
 
-            # Confirmar precio en los mejores 3 (visitar ficha si el precio no vino en el listado)
+            # Confirmar precio (visitar ficha si no vino en el listado)
             for c in relevantes[:3]:
                 precio = c.get("precio")
                 nombre = c["nombre"]
@@ -433,29 +554,84 @@ def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: 
 
         except Exception as exc:
             logger.warning("Sagitario error intento %d: %s", i, exc)
+            result["error"] = str(exc)
 
     if result["precio"] is None and result["error"] is None:
-        result["error"] = f"Sin resultados relevantes en Sagitario"
+        result["error"] = "Sin resultados relevantes en Sagitario"
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# EASY — VTEX (API pública confirmada: /api/catalog_system/pub/products/search/)
+# EASY — VTEX Catalog API (pública, confirmada ✓)
 # ════════════════════════════════════════════════════════════════════════════════
-def _easy_json_a_candidatos(data) -> list[dict]:
-    """Parsea el JSON de la API legacy VTEX de Easy."""
+
+def _vtex_candidatos_de_json(data, base_url: str) -> list[dict]:
+    """
+    Parsea el JSON de la API legacy VTEX.
+    Sirve para Easy y Sodimac (mismo formato VTEX).
+    """
     if not isinstance(data, list):
         return []
     cands = []
     for prod in data[:10]:
         nombre = prod.get("productName") or prod.get("productTitle")
         link_text = prod.get("linkText", "")
-        link = f"https://www.easy.com.ar/{link_text}/p" if link_text else None
+        link = f"{base_url}/{link_text}/p" if link_text else None
         precio = None
         for item in prod.get("items", [])[:1]:
             for seller in item.get("sellers", [])[:1]:
-                offer = seller.get("commertialOffer") or seller.get("commercialOffer") or {}
-                precio = _clean_price(offer.get("Price") or offer.get("ListPrice"))
+                offer = (
+                    seller.get("commertialOffer")
+                    or seller.get("commercialOffer")
+                    or {}
+                )
+                precio = _clean_price(
+                    offer.get("Price")
+                    or offer.get("ListPrice")
+                    or offer.get("price")
+                )
+        if nombre:
+            cands.append({"nombre": nombre, "link": link, "precio": precio})
+    return cands
+
+
+def _vtex_intelligent_search_candidatos(data, base_url: str) -> list[dict]:
+    """Parsea el JSON de VTEX Intelligent Search API."""
+    cands = []
+    prods = []
+    if isinstance(data, dict):
+        prods = (
+            data.get("products")
+            or data.get("items")
+            or data.get("data", {}).get("productSearch", {}).get("products", [])
+            or []
+        )
+    elif isinstance(data, list):
+        prods = data
+
+    for prod in prods[:10]:
+        if not isinstance(prod, dict):
+            continue
+        nombre = (
+            prod.get("productName") or prod.get("name")
+            or prod.get("productTitle") or prod.get("title")
+        )
+        link_text = prod.get("linkText") or prod.get("slug") or ""
+        link = f"{base_url}/{link_text}/p" if link_text else None
+        precio = None
+        pr = prod.get("priceRange", {})
+        if pr:
+            precio = _clean_price(
+                pr.get("sellingPrice", {}).get("lowPrice")
+                or pr.get("listPrice", {}).get("lowPrice")
+            )
+        if precio is None:
+            for item in prod.get("items", [])[:1]:
+                for seller in item.get("sellers", [])[:1]:
+                    offer = seller.get("commertialOffer") or {}
+                    precio = _clean_price(
+                        offer.get("Price") or offer.get("ListPrice")
+                    )
         if nombre:
             cands.append({"nombre": nombre, "link": link, "precio": precio})
     return cands
@@ -463,35 +639,78 @@ def _easy_json_a_candidatos(data) -> list[dict]:
 
 def scrape_easy(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    VTEX legacy catalog API — retorna JSON directamente sin necesidad de JS.
-    URL probada: /api/catalog_system/pub/products/search/QUERY?_from=0&_to=9
+    VTEX — como un humano:
+    1. Visita easy.com.ar (VTEX establece cookies vtex_session, vtex_segment, etc.)
+    2. Llama a la API de catálogo con esas cookies → JSON con precios
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
     scraper = _make_scraper()
 
+    # ── Paso humano 1: visitar homepage para obtener cookies VTEX ────────────
+    _warm_session(scraper, "https://www.easy.com.ar/",
+                  referer="https://www.google.com.ar/search?q=easy+materiales+construccion")
+
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        q_corta = " ".join(query.split()[:4])
-        q_enc   = urllib.parse.quote(q_corta)
+        # Usar solo las primeras palabras significativas para la búsqueda en path
+        q_palabras = " ".join(query.split()[:4])
+        q_enc      = urllib.parse.quote(q_palabras)
         candidatos: list[dict] = []
 
-        # API VTEX legacy (probada, devuelve JSON)
-        for api_url in [
-            f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_enc}?_from=0&_to=9",
-            f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_enc}?_from=0&_to=9&O=OrderByTopSaleDESC",
-        ]:
+        # También probar con solo la primera palabra (VTEX path-search funciona mejor así)
+        q_corta_enc = urllib.parse.quote(query.split()[0]) if query.split() else q_enc
+
+        endpoints = [
+            # API Catalog legacy (confirmada vía web_fetch — devuelve JSON con precios)
+            (
+                f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_enc}"
+                f"?_from=0&_to=9",
+                "application/json",
+            ),
+            # Con solo la primera keyword (más específico para VTEX)
+            (
+                f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_corta_enc}"
+                f"?_from=0&_to=9",
+                "application/json",
+            ),
+            # VTEX Intelligent Search
+            (
+                f"https://www.easy.com.ar/_v/api/intelligent-search/product_search/trade-policy/1"
+                f"?query={q_enc}&count=10&sort=score_desc",
+                "application/json",
+            ),
+        ]
+
+        for api_url, accept in endpoints:
             try:
                 resp = scraper.get(
                     api_url, timeout=20,
-                    headers={**HEADERS, "Accept": "application/json"},
+                    headers={
+                        **HEADERS_API,
+                        "Accept": accept,
+                        "Referer": "https://www.easy.com.ar/",
+                        "Sec-Fetch-Site": "same-origin",
+                    },
                 )
-                if resp.status_code == 200:
-                    candidatos = _easy_json_a_candidatos(resp.json())
-                    if candidatos:
-                        break
+                if resp.status_code != 200:
+                    logger.debug("Easy API HTTP %d: %s", resp.status_code, api_url[:80])
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue  # Devolvió HTML en vez de JSON (sin cookies)
+
+                if isinstance(data, list):
+                    candidatos = _vtex_candidatos_de_json(data, "https://www.easy.com.ar")
+                else:
+                    candidatos = _vtex_intelligent_search_candidatos(
+                        data, "https://www.easy.com.ar"
+                    )
+                if candidatos:
+                    break
             except Exception as exc:
-                logger.warning("Easy API error: %s", exc)
+                logger.warning("Easy endpoint error: %s", exc)
 
         mejor = _elegir_mejor(candidatos, ref)
         if mejor:
@@ -502,18 +721,15 @@ def scrape_easy(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) 
             break
 
     if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados relevantes en Easy"
+        result["error"] = "Sin resultados en Easy (VTEX puede requerir sesión)"
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# REX — Magento 2 (CSR/React) → intentar via REST y GraphQL
+# REX — Magento 2 (CSR/React) → GraphQL + REST
 # ════════════════════════════════════════════════════════════════════════════════
+
 def _rex_graphql_candidatos(scraper, query: str) -> list[dict]:
-    """
-    POST al endpoint GraphQL de Magento 2.
-    Magento 2 + PWA Studio/Hyvä usan GraphQL para búsqueda de productos.
-    """
     gql_query = {
         "query": """
         {
@@ -536,7 +752,12 @@ def _rex_graphql_candidatos(scraper, query: str) -> list[dict]:
         resp = scraper.post(
             "https://www.somosrex.com/graphql",
             json=gql_query,
-            headers={**HEADERS, "Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                **HEADERS_API,
+                "Content-Type": "application/json",
+                "Referer": "https://www.somosrex.com/",
+                "Sec-Fetch-Site": "same-origin",
+            },
             timeout=20,
         )
         if resp.status_code != 200:
@@ -562,12 +783,8 @@ def _rex_graphql_candidatos(scraper, query: str) -> list[dict]:
 
 
 def _rex_rest_candidatos(scraper, query: str) -> list[dict]:
-    """
-    Magento 2 REST API: /rest/V1/products con filtro por nombre.
-    """
     q_enc = urllib.parse.quote(f"%{query}%")
     try:
-        # Búsqueda full-text via REST
         url = (
             f"https://www.somosrex.com/rest/all/V1/products"
             f"?searchCriteria[filterGroups][0][filters][0][field]=name"
@@ -578,7 +795,7 @@ def _rex_rest_candidatos(scraper, query: str) -> list[dict]:
         )
         resp = scraper.get(
             url, timeout=20,
-            headers={**HEADERS, "Accept": "application/json"},
+            headers={**HEADERS_API, "Referer": "https://www.somosrex.com/"},
         )
         if resp.status_code != 200:
             return []
@@ -586,7 +803,7 @@ def _rex_rest_candidatos(scraper, query: str) -> list[dict]:
         cands = []
         for prod in items[:10]:
             nombre = prod.get("name")
-            url_key = prod.get("url_key") or prod.get("custom_attributes", [{}])[0].get("value", "")
+            url_key = prod.get("url_key") or ""
             link = f"https://www.somosrex.com/{url_key}.html" if url_key else None
             precio = _clean_price(prod.get("price"))
             if nombre:
@@ -598,7 +815,7 @@ def _rex_rest_candidatos(scraper, query: str) -> list[dict]:
 
 
 def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """Magento 2 — GraphQL POST primero, REST fallback."""
+    """Magento 2 — GraphQL POST primero, REST fallback. (Ya funciona ✓)"""
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
     scraper = _make_scraper()
@@ -607,10 +824,7 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
         query, ref = item["q"], item["ref"]
         q_corta = " ".join(query.split()[:5])
 
-        # Intento 1: GraphQL
         candidatos = _rex_graphql_candidatos(scraper, q_corta)
-
-        # Intento 2: REST API
         if not candidatos:
             candidatos = _rex_rest_candidatos(scraper, q_corta)
 
@@ -623,13 +837,14 @@ def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -
             break
 
     if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en Rex (Magento CSR — puede requerir JS)"
+        result["error"] = "Sin resultados en Rex"
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MERCADO LIBRE — API pública + HTML fallback
+# MERCADO LIBRE — API + HTML (warmup de sesión)
 # ════════════════════════════════════════════════════════════════════════════════
+
 def _ml_candidatos_de_html(html: str) -> list[dict]:
     cands = _candidatos_de_jsonld(html)
 
@@ -659,10 +874,19 @@ def _ml_candidatos_de_html(html: str) -> list[dict]:
 
 
 def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """MercadoLibre: API oficial primero, luego HTML de listado."""
+    """
+    MercadoLibre — como un humano:
+    1. Visita la homepage de ML (establece cookies de sesión)
+    2. Intenta la API oficial con esas cookies
+    3. Si falla la API, intenta el HTML de listado
+    """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
     scraper = _make_scraper()
+
+    # ── Paso humano 1: visitar ML para establecer sesión ──────────────────────
+    _warm_session(scraper, "https://www.mercadolibre.com.ar/",
+                  referer="https://www.google.com.ar/search?q=mercadolibre+argentina")
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
@@ -675,7 +899,13 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
                 f"https://api.mercadolibre.com/sites/MLA/search"
                 f"?q={urllib.parse.quote(q_corta)}&limit=10"
             )
-            resp = scraper.get(api_url, timeout=12)
+            resp = scraper.get(
+                api_url, timeout=12,
+                headers={
+                    **HEADERS_API,
+                    "Referer": "https://www.mercadolibre.com.ar/",
+                },
+            )
             if resp.status_code == 200:
                 for prod in resp.json().get("results", [])[:10]:
                     candidatos.append({
@@ -686,16 +916,27 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
         except Exception as exc:
             logger.warning("ML API error: %s", exc)
 
-        # B) Listado HTML con slug
+        # B) Listado HTML (paso humano: navegar a la URL de listado)
         if not candidatos:
-            try:
-                slug = re.sub(r"\s+", "-", q_corta.strip().lower())
-                url_l = f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(slug)}"
-                resp  = scraper.get(url_l, timeout=15)
-                if resp.status_code == 200 and "suspicious-traffic" not in resp.url:
-                    candidatos = _ml_candidatos_de_html(resp.text)
-            except Exception as exc:
-                logger.warning("ML listado error: %s", exc)
+            for url_listado in [
+                f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(q_corta.replace(' ', '-'))}",
+                f"https://www.mercadolibre.com.ar/buscar?q={urllib.parse.quote(q_corta)}",
+            ]:
+                try:
+                    resp = scraper.get(
+                        url_listado, timeout=15,
+                        headers={
+                            **HEADERS_NAV,
+                            "Referer": "https://www.mercadolibre.com.ar/",
+                            "Sec-Fetch-Site": "same-origin",
+                        },
+                    )
+                    if resp.status_code == 200 and "suspicious-traffic" not in resp.url:
+                        candidatos = _ml_candidatos_de_html(resp.text)
+                        if candidatos:
+                            break
+                except Exception as exc:
+                    logger.warning("ML listado error: %s", exc)
 
         if not candidatos:
             continue
@@ -718,96 +959,88 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
         break
 
     if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en ML (API puede requerir autenticación)"
+        result["error"] = "Sin resultados en ML (bloqueado por anti-bot)"
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SODIMAC — VTEX Intelligent Search API
+# SODIMAC — VTEX (mismo enfoque que Easy)
 # ════════════════════════════════════════════════════════════════════════════════
-def _sodimac_json_a_candidatos(data) -> list[dict]:
-    """Parsea respuesta de la Intelligent Search API de VTEX."""
-    cands = []
-    # Formato Intelligent Search: {"products": [...]} o {"items": [...]}
-    prods = []
-    if isinstance(data, dict):
-        prods = (
-            data.get("products")
-            or data.get("items")
-            or data.get("data", {}).get("productSearch", {}).get("products", [])
-            or []
-        )
-    elif isinstance(data, list):
-        prods = data
-    for prod in prods[:10]:
-        if not isinstance(prod, dict):
-            continue
-        nombre = (
-            prod.get("productName") or prod.get("name")
-            or prod.get("productTitle") or prod.get("title")
-        )
-        link_text = prod.get("linkText") or prod.get("slug") or ""
-        link = f"https://www.sodimac.com.ar/{link_text}/p" if link_text else None
-        precio = None
-        # VTEX priceRange
-        pr = prod.get("priceRange", {})
-        if pr:
-            precio = _clean_price(
-                pr.get("sellingPrice", {}).get("lowPrice")
-                or pr.get("listPrice", {}).get("lowPrice")
-            )
-        # VTEX items[0].sellers[0].commertialOffer.Price
-        if precio is None:
-            for item in prod.get("items", [])[:1]:
-                for seller in item.get("sellers", [])[:1]:
-                    offer = seller.get("commertialOffer") or {}
-                    precio = _clean_price(offer.get("Price") or offer.get("ListPrice"))
-        if nombre:
-            cands.append({"nombre": nombre, "link": link, "precio": precio})
-    return cands
-
 
 def scrape_sodimac(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """Sodimac Argentina — múltiples endpoints VTEX."""
+    """
+    Sodimac Argentina — VTEX, como un humano:
+    1. Visita la homepage (establece cookies VTEX)
+    2. Llama a la API de catálogo/intelligent-search con esas cookies
+    """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
     scraper = _make_scraper()
 
+    # ── Paso humano 1: visitar homepage para obtener cookies VTEX ────────────
+    _warm_session(scraper, "https://www.sodimac.com.ar/",
+                  referer="https://www.google.com.ar/search?q=sodimac+argentina+materiales")
+
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        q_corta = " ".join(query.split()[:5])
-        q_enc   = urllib.parse.quote(q_corta)
+        q_palabras    = " ".join(query.split()[:4])
+        q_enc         = urllib.parse.quote(q_palabras)
+        q_corta_enc   = urllib.parse.quote(query.split()[0]) if query.split() else q_enc
         candidatos: list[dict] = []
 
-        # Probar endpoints conocidos de VTEX para Sodimac
         endpoints = [
-            # VTEX legacy catalog search (mismo que Easy, probado)
-            (f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_enc}?_from=0&_to=9",
-             "application/json"),
+            # VTEX Catalog API legacy (mismo formato que Easy, probado)
+            (
+                f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_enc}"
+                f"?_from=0&_to=9",
+                "list",
+            ),
+            (
+                f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_corta_enc}"
+                f"?_from=0&_to=9",
+                "list",
+            ),
             # VTEX Intelligent Search
-            (f"https://www.sodimac.com.ar/_v/api/intelligent-search/product_search/trade-policy/1"
-             f"?query={q_enc}&count=10&sort=score_desc",
-             "application/json"),
-            # Búsqueda old-style Sodimac (ATG)
-            (f"https://www.sodimac.com.ar/sodimac-ar/search?Ntt={q_enc}&format=json",
-             "application/json"),
+            (
+                f"https://www.sodimac.com.ar/_v/api/intelligent-search/product_search/trade-policy/1"
+                f"?query={q_enc}&count=10&sort=score_desc",
+                "is",
+            ),
+            # Sodimac search antiguo
+            (
+                f"https://www.sodimac.com.ar/sodimac-ar/search?Ntt={q_enc}&format=json",
+                "is",
+            ),
         ]
-        for url, accept in endpoints:
+
+        for api_url, fmt in endpoints:
             try:
                 resp = scraper.get(
-                    url, timeout=20,
-                    headers={**HEADERS, "Accept": accept},
+                    api_url, timeout=20,
+                    headers={
+                        **HEADERS_API,
+                        "Referer": "https://www.sodimac.com.ar/",
+                        "Sec-Fetch-Site": "same-origin",
+                    },
                 )
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        candidatos = _sodimac_json_a_candidatos(data)
-                    except Exception:
-                        pass
-                    if candidatos:
-                        break
+                if resp.status_code != 200:
+                    logger.debug("Sodimac HTTP %d: %s", resp.status_code, api_url[:80])
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue  # Devolvió HTML (sin cookies válidas)
+
+                if fmt == "list":
+                    candidatos = _vtex_candidatos_de_json(data, "https://www.sodimac.com.ar")
+                else:
+                    candidatos = _vtex_intelligent_search_candidatos(
+                        data, "https://www.sodimac.com.ar"
+                    )
+                if candidatos:
+                    break
             except Exception as exc:
-                logger.warning("Sodimac %s error: %s", url[:60], exc)
+                logger.warning("Sodimac endpoint error: %s", exc)
 
         mejor = _elegir_mejor(candidatos, ref)
         if mejor:
@@ -818,19 +1051,20 @@ def scrape_sodimac(detalle: str, marca: str, cod_proveedor, nombre_proveedor: st
             break
 
     if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en Sodimac (API puede requerir JS)"
+        result["error"] = "Sin resultados en Sodimac (VTEX puede requerir sesión)"
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Orquestador principal
 # ════════════════════════════════════════════════════════════════════════════════
+
 def buscar_precios(detalle: str, marca: str,
                    cod_proveedor=None,
                    nombre_proveedor: str = "") -> dict[str, dict]:
     """Ejecuta los 5 scrapers en paralelo."""
     args = (detalle, marca, cod_proveedor, nombre_proveedor)
-    scrapers = {
+    scrapers_map = {
         "rex":       scrape_rex,
         "sagitario": scrape_sagitario,
         "ml":        scrape_ml,
@@ -839,10 +1073,10 @@ def buscar_precios(detalle: str, marca: str,
     }
     resultados: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {name: ex.submit(fn, *args) for name, fn in scrapers.items()}
+        futures = {name: ex.submit(fn, *args) for name, fn in scrapers_map.items()}
         for name, fut in futures.items():
             try:
-                resultados[name] = fut.result(timeout=40)
+                resultados[name] = fut.result(timeout=45)
             except Exception as exc:
                 r = _empty_result()
                 r["error"] = str(exc)
