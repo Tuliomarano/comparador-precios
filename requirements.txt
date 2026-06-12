@@ -3,3 +3,5 @@ pandas>=2.0.0
 openpyxl>=3.1.0
 requests>=2.31.0
 cloudscraper>=1.2.71
+selenium>=4.0.0
+selenium-stealth>=1.0.6

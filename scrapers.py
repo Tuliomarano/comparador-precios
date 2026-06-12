@@ -1,17 +1,16 @@
 """
 scrapers.py — Búsqueda de precios en Rex, Sagitario, ML, Sodimac y Easy.
 
-Enfoque "humano": cada scraper primero visita la homepage del sitio para
-establecer cookies y sesión (igual que haría un navegador real), y recién
-después realiza la búsqueda. Esto evita que los sistemas anti-bot bloqueen
-las requests "frías" directas a URLs de búsqueda.
+Enfoque: Selenium headless + browser real para cada sitio.
+- UN solo driver de Chrome compartido por llamada a buscar_precios()
+- Rex corre en background thread (API, no necesita browser)
+- Los otros 4 scrapers corren secuencialmente compartiendo el driver
 
-Tecnologías (jun 2026):
-  Rex        → somosrex.com               → Magento 2 GraphQL + REST
-  Sagitario  → pintureriasagitario.com.ar → WooCommerce SSR (parser posicional)
-  ML         → mercadolibre.com.ar        → API + HTML (warmup sesión)
-  Sodimac    → sodimac.com.ar             → VTEX Catalog API (warmup sesión)
-  Easy       → easy.com.ar               → VTEX Catalog API (warmup sesión, confirmado ✓)
+Por qué Selenium:
+  Sagitario → Cloudflare JS challenge (solo un browser real puede pasarlo)
+  Easy      → VTEX API pública pero bloquea requests de datacenter por fingerprint
+  Sodimac   → SPA React, API bloqueada → necesita renderizado real
+  ML        → anti-bot por fingerprint → browser real con stealth lo evita
 """
 
 import re
@@ -19,8 +18,10 @@ import json
 import html as _html
 import logging
 import difflib
+import shutil
 import concurrent.futures
 import urllib.parse
+import time
 
 import requests
 
@@ -30,51 +31,40 @@ try:
 except ImportError:
     _HAS_CLOUDSCRAPER = False
 
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    _HAS_SELENIUM = True
+except ImportError:
+    _HAS_SELENIUM = False
+
+try:
+    from selenium_stealth import stealth as _apply_stealth
+    _HAS_STEALTH = True
+except ImportError:
+    _HAS_STEALTH = False
+
 logger = logging.getLogger(__name__)
 
-# ── Headers base ──────────────────────────────────────────────────────────────
+# ── User-Agent compartido ─────────────────────────────────────────────────────
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-_SEC_CH = (
-    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
-)
 
-# Como cuando una persona navega a una página web
-HEADERS_NAV = {
+HEADERS = {
     "User-Agent":               _UA,
-    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language":          "es-AR,es;q=0.9,es-419;q=0.8",
     "Accept-Encoding":          "gzip, deflate, br",
-    "Sec-Ch-Ua":                _SEC_CH,
-    "Sec-Ch-Ua-Mobile":         "?0",
-    "Sec-Ch-Ua-Platform":       '"Windows"',
-    "Sec-Fetch-Dest":           "document",
-    "Sec-Fetch-Mode":           "navigate",
-    "Sec-Fetch-User":           "?1",
-    "Upgrade-Insecure-Requests":"1",
     "Connection":               "keep-alive",
+    "Upgrade-Insecure-Requests":"1",
 }
-
-# Como cuando el JS del navegador llama a una API (XHR/Fetch)
-HEADERS_API = {
-    "User-Agent":       _UA,
-    "Accept":           "application/json, text/plain, */*",
-    "Accept-Language":  "es-AR,es;q=0.9",
-    "Accept-Encoding":  "gzip, deflate, br",
-    "Sec-Ch-Ua":        _SEC_CH,
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest":   "empty",
-    "Sec-Fetch-Mode":   "cors",
-    "Sec-Fetch-Site":   "same-origin",
-    "Connection":       "keep-alive",
-}
-
-# Compatibilidad retroactiva para código que usa HEADERS
-HEADERS = HEADERS_NAV
 
 SCORE_MIN = 0.20
 
@@ -83,68 +73,141 @@ _STOPWORDS = {
     "por", "en", "del", "al", "lt", "lts", "kg", "kgs", "x", "und", "uni",
     "unidad", "color", "tono",
 }
-
 _SINONIMOS = {
-    "recup":    "recuplast",
-    "memb":     "membrana",
-    "membr":    "membrana",
-    "imperm":   "impermeabilizante",
-    "ext":      "exterior",
-    "int":      "interior",
-    "blco":     "blanco",
-    "blca":     "blanca",
-    "negr":     "negro",
-    "antiox":   "antioxido",
-    "sintet":   "sintetico",
-    "diluy":    "diluyente",
-    "fij":      "fijador",
-    "fijad":    "fijador",
+    "recup":  "recuplast", "memb": "membrana", "membr": "membrana",
+    "imperm": "impermeabilizante", "ext": "exterior", "int": "interior",
+    "blco": "blanco", "blca": "blanca", "antiox": "antioxido",
+    "sintet": "sintetico", "diluy": "diluyente", "fij": "fijador",
 }
 
 
-# ── Session factory ───────────────────────────────────────────────────────────
-def _make_scraper():
-    """cloudscraper con bypass de Cloudflare; fallback a requests.Session."""
-    if _HAS_CLOUDSCRAPER:
-        sc = _cs_mod.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        sc.headers.update(HEADERS_NAV)
-        return sc
-    s = requests.Session()
-    s.headers.update(HEADERS_NAV)
-    return s
+# ════════════════════════════════════════════════════════════════════════════
+# SELENIUM — driver factory y helpers
+# ════════════════════════════════════════════════════════════════════════════
 
-
-def _warm_session(scraper, base_url: str, referer: str = "https://www.google.com.ar/",
-                  timeout: int = 10) -> bool:
+def _make_driver():
     """
-    Visita la homepage del sitio para establecer cookies y sesión.
-    Un humano hace esto antes de buscar — el servidor reconoce la sesión
-    y no bloquea las requests posteriores como si fueran bots.
-    Devuelve True si el calentamiento fue exitoso.
+    Crea un driver de Chrome headless listo para scraping.
+    Detecta automáticamente el binario de Chromium (Streamlit Cloud o local).
+    Aplica selenium-stealth si está disponible para evitar detección.
+    """
+    if not _HAS_SELENIUM:
+        return None
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument(f"--user-agent={_UA}")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--lang=es-AR")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    # Buscar binarios en rutas típicas de Streamlit Cloud y Linux
+    chromium_binary = (
+        shutil.which("chromium-browser")
+        or shutil.which("chromium")
+        or shutil.which("google-chrome")
+    )
+    if chromium_binary:
+        opts.binary_location = chromium_binary
+        logger.debug("Chromium encontrado: %s", chromium_binary)
+
+    chromedriver_bin = (
+        shutil.which("chromedriver")
+        or shutil.which("chromium-chromedriver")
+    )
+
+    try:
+        if chromedriver_bin:
+            svc = Service(chromedriver_bin)
+            driver = webdriver.Chrome(service=svc, options=opts)
+        else:
+            # Intentar con webdriver_manager si está disponible
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                svc = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=svc, options=opts)
+            except Exception:
+                driver = webdriver.Chrome(options=opts)
+
+        # Eliminar señales de automatización del DOM
+        driver.execute_cdp_cmd(
+            "Network.setUserAgentOverride", {"userAgent": _UA}
+        )
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        if _HAS_STEALTH:
+            _apply_stealth(
+                driver,
+                languages=["es-AR", "es"],
+                vendor="Google Inc.",
+                platform="Win32",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True,
+            )
+
+        return driver
+
+    except Exception as exc:
+        logger.error("No se pudo inicializar Selenium: %s", exc)
+        return None
+
+
+def _fetch_api_en_browser(driver, url: str, timeout_sec: int = 12):
+    """
+    Llama a una URL via fetch() DESDE DENTRO del browser.
+    Hereda cookies, fingerprint y sesión del browser → bypasea anti-bot.
+    Retorna el objeto Python parseado del JSON, o None si falla.
+    """
+    script = """
+    var done = arguments[arguments.length - 1];
+    fetch(arguments[0], {
+        headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
+        },
+        credentials: 'include'
+    })
+    .then(r => r.text())
+    .then(t => done(t))
+    .catch(e => done(null));
     """
     try:
-        r = scraper.get(
-            base_url,
-            headers={
-                **HEADERS_NAV,
-                "Referer": referer,
-                "Sec-Fetch-Site": "cross-site",
-            },
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        logger.debug("Warmup %s → HTTP %d", base_url, r.status_code)
-        return r.status_code < 400
+        driver.set_script_timeout(timeout_sec)
+        raw = driver.execute_async_script(script, url)
+        if raw is None:
+            return None
+        return json.loads(raw)
     except Exception as exc:
-        logger.warning("Warmup fallido %s: %s", base_url, exc)
-        return False
+        logger.warning("fetch_en_browser error para %s: %s", url[:80], exc)
+        return None
 
 
-# ── Helpers de precio y texto ─────────────────────────────────────────────────
+def _esperar_render(driver, css_selector: str, timeout: int = 8):
+    """Espera a que un elemento CSS esté presente en el DOM (React renderizó)."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, css_selector))
+        )
+    except Exception:
+        pass  # Timeout → usamos lo que hay
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HELPERS compartidos (texto, precio, scoring, queries)
+# ════════════════════════════════════════════════════════════════════════════
+
 def _clean_price(value) -> float | None:
-    """Convierte string de precio AR (1.234,56) o float/int a float."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -156,10 +219,7 @@ def _clean_price(value) -> float | None:
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
     elif "," in text:
-        if re.match(r"^\d{1,3},\d{3}$", text):
-            text = text.replace(",", "")
-        else:
-            text = text.replace(",", ".")
+        text = text.replace(",", "") if re.match(r"^\d{1,3},\d{3}$", text) else text.replace(",", ".")
     else:
         if re.match(r"^\d{1,3}(\.\d{3})+$", text):
             text = text.replace(".", "")
@@ -170,7 +230,7 @@ def _clean_price(value) -> float | None:
         return None
 
 
-def _normalizar_texto(s: str) -> str:
+def _normalizar(s: str) -> str:
     if not s:
         return ""
     s = _html.unescape(str(s)).lower()
@@ -178,51 +238,45 @@ def _normalizar_texto(s: str) -> str:
         s = s.replace(a, b)
     s = re.sub(r"(\d+)\s*(kgs?|kilos?)\b",    r"\1kg", s)
     s = re.sub(r"(\d+)\s*(lts?|litros?|l)\b", r"\1lt", s)
-    s = re.sub(r"(\d+)\s*(grs?|gramos?)\b",   r"\1gr", s)
-    s = re.sub(r"(\d+)\s*(ml|cc)\b",          r"\1ml", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
 def _tokens(s: str) -> list[str]:
-    out = []
-    for t in _normalizar_texto(s).split():
-        if t in _STOPWORDS or len(t) <= 1:
-            continue
-        out.append(_SINONIMOS.get(t, t))
-    return out
+    return [
+        _SINONIMOS.get(t, t)
+        for t in _normalizar(s).split()
+        if t not in _STOPWORDS and len(t) > 1
+    ]
 
 
 def score_similitud(buscado: str, encontrado: str) -> float:
-    tb = _tokens(buscado)
-    te = _tokens(encontrado)
+    tb, te = _tokens(buscado), _tokens(encontrado)
     if not tb or not te:
         return 0.0
     set_b, set_e = set(tb), set(te)
     comunes = set_b & set_e
-    cobertura = len(comunes) / len(set_b)
-    if cobertura < 1.0:
+    cob = len(comunes) / len(set_b)
+    if cob < 1.0:
         extra = sum(
-            1 for tok in (set_b - set_e)
-            if any(tok in e or e in tok for e in set_e if len(tok) >= 4 and len(e) >= 4)
+            1 for t in (set_b - set_e)
+            if any(t in e or e in t for e in set_e if len(t) >= 4 and len(e) >= 4)
         )
-        cobertura = min(1.0, cobertura + extra / len(set_b))
+        cob = min(1.0, cob + extra / len(set_b))
     nums_b = {t for t in set_b if any(c.isdigit() for c in t)}
     nums_e = {t for t in set_e if any(c.isdigit() for c in t)}
-    match_num = len(nums_b & nums_e) / len(nums_b) if nums_b else 1.0
-    fuzzy = difflib.SequenceMatcher(None, " ".join(tb), " ".join(te)).ratio()
-    return round(min(1.0, 0.60 * cobertura + 0.25 * match_num + 0.15 * fuzzy), 3)
+    mn = len(nums_b & nums_e) / len(nums_b) if nums_b else 1.0
+    fz = difflib.SequenceMatcher(None, " ".join(tb), " ".join(te)).ratio()
+    return round(min(1.0, 0.60*cob + 0.25*mn + 0.15*fz), 3)
 
 
-# ── Construcción de queries ───────────────────────────────────────────────────
-def _cod_str(cod_proveedor) -> str | None:
-    if cod_proveedor in (None, "", "nan", "None"):
+def _cod_str(cod) -> str | None:
+    if cod in (None, "", "nan", "None"):
         return None
     try:
-        return str(int(float(cod_proveedor)))
+        return str(int(float(cod)))
     except (ValueError, TypeError):
-        s = str(cod_proveedor).strip()
-        return s or None
+        return str(cod).strip() or None
 
 
 def _query_comercial(detalle: str, marca: str) -> str:
@@ -233,12 +287,11 @@ def _query_comercial(detalle: str, marca: str) -> str:
 
 
 def _build_queries(detalle: str, marca: str, cod_proveedor) -> list[dict]:
-    detalle = (detalle or "").strip()
-    marca   = (marca   or "").strip()
-    ref     = f"{detalle} {marca}".strip()
-    cod     = _cod_str(cod_proveedor)
-    q_com   = _query_comercial(detalle, marca)
-    q_det   = " ".join(_tokens(detalle)[:6])
+    detalle, marca = (detalle or "").strip(), (marca or "").strip()
+    ref = f"{detalle} {marca}".strip()
+    cod = _cod_str(cod_proveedor)
+    q_com = _query_comercial(detalle, marca)
+    q_det = " ".join(_tokens(detalle)[:6])
     queries, seen = [], set()
     for q in [q_com, q_det, cod]:
         if not q:
@@ -256,49 +309,31 @@ def _empty_result() -> dict:
             "intento": None, "score": None, "error": None}
 
 
-def _dedup_candidatos(cands: list[dict]) -> list[dict]:
-    vistos, unicos = set(), []
+def _dedup(cands: list[dict]) -> list[dict]:
+    seen, out = set(), []
     for c in cands:
         k = (c.get("nombre") or "").lower()[:60]
-        if k and k not in vistos:
-            vistos.add(k)
-            unicos.append(c)
-    return unicos
+        if k and k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
 
 
-def _elegir_mejor(candidatos: list[dict], ref: str) -> dict | None:
-    if not candidatos:
+def _elegir_mejor(cands: list[dict], ref: str) -> dict | None:
+    if not cands:
         return None
-    for c in candidatos:
+    for c in cands:
         c["score"] = score_similitud(ref, c.get("nombre", ""))
-    candidatos.sort(key=lambda c: c["score"], reverse=True)
-    for c in candidatos:
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    for c in cands:
         if c["score"] >= SCORE_MIN and c.get("precio"):
             return c
-    mejor = candidatos[0]
-    return mejor if mejor["score"] >= SCORE_MIN and mejor.get("precio") else None
-
-
-# ── Extractor JSON-LD genérico ────────────────────────────────────────────────
-def _push_ld_product(node: dict, cands: list[dict]):
-    if not isinstance(node, dict):
-        return
-    nombre = node.get("name")
-    if not nombre:
-        return
-    link = node.get("url") or node.get("@id")
-    offers = node.get("offers", {})
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-    precio = (
-        _clean_price(offers.get("price") or offers.get("lowPrice"))
-        if isinstance(offers, dict) else None
-    )
-    cands.append({"nombre": nombre, "link": link, "precio": precio})
+    top = cands[0]
+    return top if top["score"] >= SCORE_MIN and top.get("precio") else None
 
 
 def _candidatos_de_jsonld(html: str) -> list[dict]:
-    cands: list[dict] = []
+    cands = []
     for blk in re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL | re.IGNORECASE,
@@ -308,47 +343,52 @@ def _candidatos_de_jsonld(html: str) -> list[dict]:
         except Exception:
             continue
         nodes = obj if isinstance(obj, list) else obj.get("@graph", [obj])
-        nodes = nodes if isinstance(nodes, list) else [nodes]
-        for node in nodes:
+        for node in (nodes if isinstance(nodes, list) else [nodes]):
             if not isinstance(node, dict):
                 continue
             t = node.get("@type", "")
             tlist = t if isinstance(t, list) else [t]
+            if "Product" in tlist:
+                nombre = node.get("name")
+                link = node.get("url") or node.get("@id")
+                offers = node.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                precio = _clean_price(
+                    offers.get("price") or offers.get("lowPrice")
+                ) if isinstance(offers, dict) else None
+                if nombre:
+                    cands.append({"nombre": nombre, "link": link, "precio": precio})
             if "ItemList" in tlist:
                 for el in node.get("itemListElement", []):
                     prod = el.get("item", el) if isinstance(el, dict) else {}
-                    _push_ld_product(prod, cands)
-            if "Product" in tlist:
-                _push_ld_product(node, cands)
-    return cands
+                    if not isinstance(prod, dict):
+                        continue
+                    nombre = prod.get("name")
+                    link = prod.get("url") or prod.get("@id")
+                    offers = prod.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    precio = _clean_price(
+                        offers.get("price") or offers.get("lowPrice")
+                    ) if isinstance(offers, dict) else None
+                    if nombre:
+                        cands.append({"nombre": nombre, "link": link, "precio": precio})
+    return _dedup(cands)
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# SAGITARIO — WooCommerce SSR
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# SAGITARIO — WooCommerce SSR (Cloudflare)
+# Selenium resuelve el JS challenge de Cloudflare que bloquea requests simples
+# ════════════════════════════════════════════════════════════════════════════
 
 def _sagitario_candidatos_de_html(html: str) -> list[dict]:
     """
-    Parser posicional para WooCommerce.
-
-    PROBLEMA DEL PARSER ANTERIOR: usaba <li>(.*?)</li> con re.DOTALL,
-    que es "lazy" y se detiene en el primer </li> anidado dentro de la card,
-    cortando el bloque antes de llegar al precio.
-
-    NUEVA ESTRATEGIA: no delimitamos por </li>. En cambio:
-      1. Encontramos todos los headings de producto (h2/h6 con link a /producto/)
-      2. Encontramos todos los precios en el HTML (patrón "El precio actual es:")
-      3. Unimos heading ↔ precio más cercano por posición en el documento
-         (igual que haría una persona leyendo la página de arriba a abajo)
+    Parser posicional — no depende de límites de </li> que se cortan.
+    Estrategia: posición de headings de producto ↔ posición de precios en el HTML.
     """
-    cands: list[dict] = []
+    headings: list[tuple[int, str, str]] = []
 
-    # ── Paso 1: encontrar todos los headings de producto con su URL ──────────
-    # WooCommerce pone el nombre del producto en un heading con clase
-    # "woocommerce-loop-product__title", que contiene un <a href="/producto/...">
-    headings: list[tuple[int, str, str]] = []  # (pos, url, nombre)
-
-    # Patrón A: heading con clase WooCommerce explícita
     for m in re.finditer(
         r'woocommerce-loop-product__title[^>]*>.*?'
         r'<a\s[^>]*href="(https://pintureriasagitario\.com\.ar/producto/[^"]+)"[^>]*>'
@@ -359,7 +399,6 @@ def _sagitario_candidatos_de_html(html: str) -> list[dict]:
         if nombre:
             headings.append((m.start(), m.group(1), nombre))
 
-    # Patrón B: cualquier heading h2/h6 que contenga un link a /producto/
     if not headings:
         for m in re.finditer(
             r'<h[1-6][^>]*>.*?'
@@ -372,204 +411,131 @@ def _sagitario_candidatos_de_html(html: str) -> list[dict]:
                 headings.append((m.start(), m.group(1), nombre))
 
     if not headings:
-        logger.warning("Sagitario: no se encontraron headings de producto")
         return []
 
-    # ── Paso 2: encontrar todos los precios con su posición ──────────────────
+    # Precios: "El precio actual es: $ NNN" (texto accesible WooCommerce)
+    precios_actuales = [
+        (m.start(), p)
+        for m in re.finditer(r'El precio actual es:.*?\$\s*([\d.,]+)', html, re.DOTALL)
+        if (p := _clean_price(m.group(1))) and p > 100
+    ]
 
-    # A) Texto accesible WooCommerce: "El precio actual es: $ 154.287,00."
-    #    Este es el patrón más confiable porque es texto literal, no HTML.
-    precios_actuales: list[tuple[int, float]] = []  # (pos, precio)
-    for m in re.finditer(
-        r'El precio actual es:.*?\$\s*([\d.,]+)', html, re.DOTALL
-    ):
-        p = _clean_price(m.group(1))
-        if p and p > 100:
-            precios_actuales.append((m.start(), p))
+    # Precio en <ins><bdi> (oferta)
+    precios_ins = [
+        (m.start(), p)
+        for m in re.finditer(
+            r'<ins[^>]*>.*?<bdi[^>]*>(.*?)</bdi>.*?</ins>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        if (p := _clean_price(re.sub(r"<[^>]+>", "", m.group(1)))) and p > 100
+    ]
 
-    # B) Precio de oferta: dentro de <ins>...<bdi>PRECIO</bdi>...</ins>
-    precios_ins: list[tuple[int, float]] = []
-    for m in re.finditer(
-        r'<ins[^>]*>.*?<bdi[^>]*>(.*?)</bdi>.*?</ins>',
-        html, re.DOTALL | re.IGNORECASE,
-    ):
-        text = re.sub(r"<[^>]+>", "", m.group(1))
-        p = _clean_price(text)
-        if p and p > 100:
-            precios_ins.append((m.start(), p))
-
-    # C) Fallback: cualquier <bdi> fuera de <del>
-    #    (para productos sin descuento, el precio está en <bdi> sin <ins>/<del>)
+    # Precio en <bdi> sin <del>
     html_sin_del = re.sub(r"<del[^>]*>.*?</del>", "", html,
                           flags=re.DOTALL | re.IGNORECASE)
-    precios_bdi: list[tuple[int, float]] = []
-    for m in re.finditer(
-        r'<bdi[^>]*>(.*?)</bdi>', html_sin_del, re.DOTALL | re.IGNORECASE
-    ):
-        text = re.sub(r"<[^>]+>", "", m.group(1))
-        p = _clean_price(text)
-        if p and p > 100:
-            precios_bdi.append((m.start(), p))
+    precios_bdi = [
+        (m.start(), p)
+        for m in re.finditer(r'<bdi[^>]*>(.*?)</bdi>', html_sin_del, re.DOTALL | re.IGNORECASE)
+        if (p := _clean_price(re.sub(r"<[^>]+>", "", m.group(1)))) and p > 100
+    ]
 
-    # ── Paso 3: para cada heading, tomar el primer precio que aparece después ─
-    # (un humano leería de arriba hacia abajo y asociaría el precio con el
-    #  nombre que está justo arriba de él en la grilla)
+    cands = []
     for i, (hpos, url, nombre) in enumerate(headings):
-        # El rango es desde este heading hasta el próximo heading
         next_pos = headings[i + 1][0] if i + 1 < len(headings) else len(html)
-
         precio = None
-
-        # Intentar con "El precio actual es:" primero (más preciso)
         for ppos, p in precios_actuales:
             if hpos <= ppos < next_pos:
                 precio = p
                 break
-
-        # Si no: intentar con <ins>
         if precio is None:
             for ppos, p in precios_ins:
                 if hpos <= ppos < next_pos:
                     precio = p
                     break
-
-        # Si no: intentar con <bdi> genérico
         if precio is None:
             for ppos, p in precios_bdi:
                 if hpos <= ppos < next_pos:
                     precio = p
                     break
-
         cands.append({"nombre": nombre, "link": url, "precio": precio})
 
-    return _dedup_candidatos(cands)
+    return _dedup(cands)
 
 
-def _sagitario_precio_de_pagina(scraper, url: str) -> tuple[float | None, str | None]:
-    """Visita la ficha del producto y extrae precio + nombre (fallback)."""
-    try:
-        r = scraper.get(url, headers=HEADERS_NAV, timeout=12)
-        h = r.text
-
-        # JSON-LD del producto individual
-        cands = _candidatos_de_jsonld(h)
-        for c in cands:
-            if c.get("precio"):
-                return c["precio"], c.get("nombre")
-
-        # Regex directos en la ficha
-        precio = None
-        m = re.search(r'"price"\s*:\s*["\']?([\d.,]+)', h)
-        if m:
-            precio = _clean_price(m.group(1))
-
-        nombre = None
-        m = re.search(r"<h1[^>]*>(.*?)</h1>", h, re.DOTALL)
-        if m:
-            nombre = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-
-        return precio, nombre
-    except Exception as exc:
-        logger.warning("Sagitario ficha error: %s", exc)
-        return None, None
-
-
-def scrape_sagitario(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+def _scrape_sagitario_browser(driver, detalle: str, marca: str,
+                               cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    WooCommerce SSR — como un humano:
-    1. Visita la homepage (establece cookies/sesión Cloudflare + WordPress)
-    2. Realiza la búsqueda con las cookies ya establecidas
-    3. Parsea el HTML usando posición (no límites de </li>)
+    Como un humano:
+    1. Entra a pintureriasagitario.com.ar (Cloudflare: solo Chrome real pasa)
+    2. Busca el producto con la barra de búsqueda (navega a la URL de search)
+    3. Lee el HTML renderizado y extrae productos
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
-    scraper = _make_scraper()
 
-    # ── Paso humano 1: visitar homepage como si vinieras de Google ────────────
-    _warm_session(
-        scraper,
-        "https://pintureriasagitario.com.ar/",
-        referer="https://www.google.com.ar/search?q=pintureria+sagitario+argentina",
-    )
+    try:
+        # Paso 1: Homepage (Cloudflare challenge — Chrome lo resuelve automáticamente)
+        driver.get("https://pintureriasagitario.com.ar/")
+        time.sleep(3)  # Esperar que Cloudflare valide el browser
+    except Exception as exc:
+        result["error"] = f"Sagitario warmup error: {exc}"
+        return result
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
         try:
-            # ── Paso humano 2: buscar con Referer del mismo sitio ─────────────
-            url = (
+            # Paso 2: Navegar a resultados de búsqueda (igual que tipear en el buscador)
+            search_url = (
                 "https://pintureriasagitario.com.ar/?"
                 + urllib.parse.urlencode({"s": query, "post_type": "product"})
             )
-            resp = scraper.get(
-                url, timeout=20,
-                headers={
-                    **HEADERS_NAV,
-                    "Referer": "https://pintureriasagitario.com.ar/",
-                    "Sec-Fetch-Site": "same-origin",
-                },
-            )
+            driver.get(search_url)
+            # Esperar a que aparezcan las tarjetas de producto
+            _esperar_render(driver, ".products .product, ul.products li", timeout=8)
 
-            if resp.status_code != 200:
-                result["error"] = f"Sagitario HTTP {resp.status_code}"
-                logger.warning("Sagitario HTTP %d para '%s'", resp.status_code, query)
-                continue
+            html = driver.page_source
 
-            # Detectar página de bloqueo / captcha
-            if "suspicious" in resp.url or "captcha" in resp.text.lower():
-                result["error"] = "Sagitario: bloqueado por anti-bot"
-                logger.warning("Sagitario: posible captcha/bloqueo")
-                continue
+            # Detectar si Cloudflare devolvió captcha en vez de productos
+            if "challenge" in driver.current_url or (
+                "cloudflare" in html.lower() and "product" not in html.lower()
+            ):
+                logger.warning("Sagitario: Cloudflare challenge activo")
+                time.sleep(4)
+                html = driver.page_source
 
-            candidatos = _sagitario_candidatos_de_html(resp.text)
+            candidatos = _sagitario_candidatos_de_html(html)
             if not candidatos:
-                logger.warning("Sagitario: 0 candidatos para '%s'", query)
                 continue
 
-            # Scoring
             for c in candidatos:
                 c["score"] = score_similitud(ref, c["nombre"])
             candidatos.sort(key=lambda c: c["score"], reverse=True)
             relevantes = [c for c in candidatos if c["score"] >= SCORE_MIN]
 
-            if not relevantes:
-                logger.warning(
-                    "Sagitario: score insuficiente (mejor %.2f para '%s')",
-                    candidatos[0]["score"], candidatos[0]["nombre"]
-                )
-                continue
-
-            # Confirmar precio (visitar ficha si no vino en el listado)
             for c in relevantes[:3]:
-                precio = c.get("precio")
-                nombre = c["nombre"]
-                if precio is None and c.get("link"):
-                    precio, nom_ficha = _sagitario_precio_de_pagina(scraper, c["link"])
-                    nombre = nom_ficha or nombre
-                if precio:
+                if c.get("precio"):
                     result.update(
-                        precio=precio, url=c.get("link") or url,
-                        nombre=nombre, intento=i, score=c["score"],
+                        precio=c["precio"], url=c.get("link") or search_url,
+                        nombre=c["nombre"], intento=i, score=c["score"],
                     )
                     return result
 
         except Exception as exc:
-            logger.warning("Sagitario error intento %d: %s", i, exc)
-            result["error"] = str(exc)
+            logger.warning("Sagitario intento %d: %s", i, exc)
 
-    if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados relevantes en Sagitario"
+    if result["precio"] is None:
+        result["error"] = "Sin resultados en Sagitario"
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# EASY — VTEX Catalog API (pública, confirmada ✓)
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# EASY — VTEX (API pública, confirmada ✓)
+# El problema es que requests de datacenter son bloqueados.
+# Solución: fetch() DESDE DENTRO del browser (hereda cookies + fingerprint)
+# ════════════════════════════════════════════════════════════════════════════
 
 def _vtex_candidatos_de_json(data, base_url: str) -> list[dict]:
-    """
-    Parsea el JSON de la API legacy VTEX.
-    Sirve para Easy y Sodimac (mismo formato VTEX).
-    """
+    """Parsea JSON de la API legacy de VTEX (Easy y Sodimac usan el mismo formato)."""
     if not isinstance(data, list):
         return []
     cands = []
@@ -580,283 +546,235 @@ def _vtex_candidatos_de_json(data, base_url: str) -> list[dict]:
         precio = None
         for item in prod.get("items", [])[:1]:
             for seller in item.get("sellers", [])[:1]:
-                offer = (
-                    seller.get("commertialOffer")
-                    or seller.get("commercialOffer")
-                    or {}
-                )
-                precio = _clean_price(
-                    offer.get("Price")
-                    or offer.get("ListPrice")
-                    or offer.get("price")
-                )
+                offer = seller.get("commertialOffer") or seller.get("commercialOffer") or {}
+                precio = _clean_price(offer.get("Price") or offer.get("ListPrice"))
         if nombre:
             cands.append({"nombre": nombre, "link": link, "precio": precio})
     return cands
 
 
-def _vtex_intelligent_search_candidatos(data, base_url: str) -> list[dict]:
-    """Parsea el JSON de VTEX Intelligent Search API."""
+def _vtex_intelligent_search(data, base_url: str) -> list[dict]:
+    """Parsea respuesta del Intelligent Search de VTEX."""
     cands = []
-    prods = []
-    if isinstance(data, dict):
-        prods = (
-            data.get("products")
-            or data.get("items")
-            or data.get("data", {}).get("productSearch", {}).get("products", [])
-            or []
-        )
-    elif isinstance(data, list):
-        prods = data
-
+    prods = (data or {}).get("products", []) if isinstance(data, dict) else (data or [])
     for prod in prods[:10]:
         if not isinstance(prod, dict):
             continue
-        nombre = (
-            prod.get("productName") or prod.get("name")
-            or prod.get("productTitle") or prod.get("title")
-        )
-        link_text = prod.get("linkText") or prod.get("slug") or ""
-        link = f"{base_url}/{link_text}/p" if link_text else None
+        nombre = prod.get("productName") or prod.get("name") or prod.get("productTitle")
+        slug = prod.get("linkText") or prod.get("slug") or ""
+        link = f"{base_url}/{slug}/p" if slug else None
         precio = None
         pr = prod.get("priceRange", {})
         if pr:
-            precio = _clean_price(
-                pr.get("sellingPrice", {}).get("lowPrice")
-                or pr.get("listPrice", {}).get("lowPrice")
-            )
+            precio = _clean_price(pr.get("sellingPrice", {}).get("lowPrice"))
         if precio is None:
             for item in prod.get("items", [])[:1]:
                 for seller in item.get("sellers", [])[:1]:
                     offer = seller.get("commertialOffer") or {}
-                    precio = _clean_price(
-                        offer.get("Price") or offer.get("ListPrice")
-                    )
+                    precio = _clean_price(offer.get("Price") or offer.get("ListPrice"))
         if nombre:
             cands.append({"nombre": nombre, "link": link, "precio": precio})
     return cands
 
 
-def scrape_easy(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+def _scrape_easy_browser(driver, detalle: str, marca: str,
+                          cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    VTEX — como un humano:
-    1. Visita easy.com.ar (VTEX establece cookies vtex_session, vtex_segment, etc.)
-    2. Llama a la API de catálogo con esas cookies → JSON con precios
+    Como un humano:
+    1. Abre easy.com.ar (VTEX setea cookies de sesión)
+    2. Llama la API de catálogo desde DENTRO del browser (fetch() hereda cookies)
+    3. Extrae productos y precios del JSON
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
-    scraper = _make_scraper()
 
-    # ── Paso humano 1: visitar homepage para obtener cookies VTEX ────────────
-    _warm_session(scraper, "https://www.easy.com.ar/",
-                  referer="https://www.google.com.ar/search?q=easy+materiales+construccion")
+    try:
+        driver.get("https://www.easy.com.ar/")
+        time.sleep(2)  # VTEX necesita tiempo para setear cookies
+    except Exception as exc:
+        result["error"] = f"Easy warmup error: {exc}"
+        return result
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        # Usar solo las primeras palabras significativas para la búsqueda en path
-        q_palabras = " ".join(query.split()[:4])
-        q_enc      = urllib.parse.quote(q_palabras)
+        palabras = query.split()
+        q_full   = urllib.parse.quote(" ".join(palabras[:4]))
+        q_short  = urllib.parse.quote(palabras[0]) if palabras else q_full
+
         candidatos: list[dict] = []
 
-        # También probar con solo la primera palabra (VTEX path-search funciona mejor así)
-        q_corta_enc = urllib.parse.quote(query.split()[0]) if query.split() else q_enc
-
-        endpoints = [
-            # API Catalog legacy (confirmada vía web_fetch — devuelve JSON con precios)
-            (
-                f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_enc}"
-                f"?_from=0&_to=9",
-                "application/json",
-            ),
-            # Con solo la primera keyword (más específico para VTEX)
-            (
-                f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_corta_enc}"
-                f"?_from=0&_to=9",
-                "application/json",
-            ),
-            # VTEX Intelligent Search
-            (
-                f"https://www.easy.com.ar/_v/api/intelligent-search/product_search/trade-policy/1"
-                f"?query={q_enc}&count=10&sort=score_desc",
-                "application/json",
-            ),
-        ]
-
-        for api_url, accept in endpoints:
-            try:
-                resp = scraper.get(
-                    api_url, timeout=20,
-                    headers={
-                        **HEADERS_API,
-                        "Accept": accept,
-                        "Referer": "https://www.easy.com.ar/",
-                        "Sec-Fetch-Site": "same-origin",
-                    },
-                )
-                if resp.status_code != 200:
-                    logger.debug("Easy API HTTP %d: %s", resp.status_code, api_url[:80])
-                    continue
-                try:
-                    data = resp.json()
-                except Exception:
-                    continue  # Devolvió HTML en vez de JSON (sin cookies)
-
-                if isinstance(data, list):
-                    candidatos = _vtex_candidatos_de_json(data, "https://www.easy.com.ar")
-                else:
-                    candidatos = _vtex_intelligent_search_candidatos(
-                        data, "https://www.easy.com.ar"
-                    )
-                if candidatos:
-                    break
-            except Exception as exc:
-                logger.warning("Easy endpoint error: %s", exc)
+        # Probar las API de VTEX desde dentro del browser
+        for api_url in [
+            f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_full}?_from=0&_to=9",
+            f"https://www.easy.com.ar/api/catalog_system/pub/products/search/{q_short}?_from=0&_to=9",
+            f"https://www.easy.com.ar/_v/api/intelligent-search/product_search/trade-policy/1?query={q_full}&count=10&sort=score_desc",
+        ]:
+            data = _fetch_api_en_browser(driver, api_url)
+            if isinstance(data, list):
+                candidatos = _vtex_candidatos_de_json(data, "https://www.easy.com.ar")
+            elif isinstance(data, dict):
+                candidatos = _vtex_intelligent_search(data, "https://www.easy.com.ar")
+            if candidatos:
+                break
 
         mejor = _elegir_mejor(candidatos, ref)
         if mejor:
-            result.update(
-                precio=mejor["precio"], url=mejor["link"],
-                nombre=mejor["nombre"], intento=i, score=mejor["score"],
-            )
+            result.update(precio=mejor["precio"], url=mejor["link"],
+                          nombre=mejor["nombre"], intento=i, score=mejor["score"])
             break
 
-    if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en Easy (VTEX puede requerir sesión)"
+    if result["precio"] is None:
+        result["error"] = "Sin resultados en Easy"
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# REX — Magento 2 (CSR/React) → GraphQL + REST
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# SODIMAC — VTEX SPA
+# Su API está bloqueada desde afuera. Solución: renderizar la página de
+# búsqueda con Selenium y parsear el DOM resultante
+# ════════════════════════════════════════════════════════════════════════════
 
-def _rex_graphql_candidatos(scraper, query: str) -> list[dict]:
-    gql_query = {
-        "query": """
-        {
-          products(search: "%s", pageSize: 10) {
-            items {
-              name
-              url_key
-              price_range {
-                minimum_price {
-                  regular_price { value currency }
-                  final_price   { value currency }
-                }
-              }
-            }
-          }
-        }
-        """ % query.replace('"', '\\"')
-    }
-    try:
-        resp = scraper.post(
-            "https://www.somosrex.com/graphql",
-            json=gql_query,
-            headers={
-                **HEADERS_API,
-                "Content-Type": "application/json",
-                "Referer": "https://www.somosrex.com/",
-                "Sec-Fetch-Site": "same-origin",
-            },
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        items = data.get("data", {}).get("products", {}).get("items", [])
-        cands = []
-        for prod in items[:10]:
-            nombre = prod.get("name")
-            url_key = prod.get("url_key", "")
-            link = f"https://www.somosrex.com/{url_key}.html" if url_key else None
-            pr = prod.get("price_range", {}).get("minimum_price", {})
-            precio = _clean_price(
-                pr.get("final_price", {}).get("value")
-                or pr.get("regular_price", {}).get("value")
+def _sodimac_candidatos_de_html(html: str) -> list[dict]:
+    """Extrae productos del HTML renderizado de Sodimac (VTEX IO frontend)."""
+    cands = []
+
+    # 1) JSON-LD (VTEX IO incluye esto en el DOM renderizado)
+    cands = _candidatos_de_jsonld(html)
+
+    # 2) Regex sobre el HTML para nombres y precios (VTEX IO)
+    if not cands:
+        # Buscar bloques de producto por patrones de precio + nombre
+        for blk in re.split(r'(?=<[a-z][^>]*\bproduct[^>]*>|<article)', html, flags=re.IGNORECASE):
+            nom_m = re.search(
+                r'(?:productName|product-name|vtex-product-name)[^>]*>(.*?)<',
+                blk, re.DOTALL | re.IGNORECASE
             )
-            if nombre:
-                cands.append({"nombre": nombre, "link": link, "precio": precio})
-        return cands
-    except Exception as exc:
-        logger.warning("Rex GraphQL error: %s", exc)
-        return []
+            if not nom_m:
+                nom_m = re.search(r'<h[23][^>]*>(.*?)</h[23]>', blk, re.DOTALL)
+            link_m = re.search(r'href="(/[^"]*(?:p/?$|/p\?)[^"]*|[^"]*sodimac\.com\.ar[^"]*)"', blk)
+            price_m = re.search(
+                r'(?:sellingPrice|bestPrice|Price)["\s:]+\$?\s*([\d.,]+)',
+                blk, re.IGNORECASE
+            )
+            if not price_m:
+                price_m = re.search(r'\$([\d.,]+)', blk)
+            if nom_m:
+                nombre = re.sub(r"<[^>]+>", "", nom_m.group(1)).strip()
+                precio = _clean_price(price_m.group(1)) if price_m else None
+                link = link_m.group(1) if link_m else None
+                if link and not link.startswith("http"):
+                    link = "https://www.sodimac.com.ar" + link
+                if nombre and len(nombre) > 3:
+                    cands.append({"nombre": nombre, "link": link, "precio": precio})
+
+    # 3) Extraer del JSON de estado de la tienda (VTEX IO inyecta __STATE__)
+    if not cands:
+        state_m = re.search(r'window\.__STATE__\s*=\s*({.*?});', html, re.DOTALL)
+        if state_m:
+            try:
+                state = json.loads(state_m.group(1))
+                for key, val in state.items():
+                    if isinstance(val, dict) and val.get("__typename") == "Product":
+                        nombre = val.get("productName") or val.get("name")
+                        slug = val.get("linkText") or val.get("slug") or ""
+                        link = f"https://www.sodimac.com.ar/{slug}/p" if slug else None
+                        precio = None
+                        items = val.get("items") or []
+                        for item in (items[:1] if isinstance(items, list) else []):
+                            sellers = item.get("sellers") or []
+                            for seller in (sellers[:1] if isinstance(sellers, list) else []):
+                                offer = seller.get("commertialOffer") or {}
+                                precio = _clean_price(offer.get("Price") or offer.get("ListPrice"))
+                        if nombre:
+                            cands.append({"nombre": nombre, "link": link, "precio": precio})
+            except Exception:
+                pass
+
+    return _dedup(cands)
 
 
-def _rex_rest_candidatos(scraper, query: str) -> list[dict]:
-    q_enc = urllib.parse.quote(f"%{query}%")
-    try:
-        url = (
-            f"https://www.somosrex.com/rest/all/V1/products"
-            f"?searchCriteria[filterGroups][0][filters][0][field]=name"
-            f"&searchCriteria[filterGroups][0][filters][0][value]={q_enc}"
-            f"&searchCriteria[filterGroups][0][filters][0][condition_type]=like"
-            f"&searchCriteria[pageSize]=10"
-            f"&fields=items[name,custom_attributes,price,extension_attributes,url_key]"
-        )
-        resp = scraper.get(
-            url, timeout=20,
-            headers={**HEADERS_API, "Referer": "https://www.somosrex.com/"},
-        )
-        if resp.status_code != 200:
-            return []
-        items = resp.json().get("items", [])
-        cands = []
-        for prod in items[:10]:
-            nombre = prod.get("name")
-            url_key = prod.get("url_key") or ""
-            link = f"https://www.somosrex.com/{url_key}.html" if url_key else None
-            precio = _clean_price(prod.get("price"))
-            if nombre:
-                cands.append({"nombre": nombre, "link": link, "precio": precio})
-        return cands
-    except Exception as exc:
-        logger.warning("Rex REST error: %s", exc)
-        return []
-
-
-def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """Magento 2 — GraphQL POST primero, REST fallback. (Ya funciona ✓)"""
+def _scrape_sodimac_browser(driver, detalle: str, marca: str,
+                             cod_proveedor, nombre_proveedor: str) -> dict:
+    """
+    Como un humano:
+    1. Abre sodimac.com.ar (establece sesión VTEX)
+    2. Navega a la búsqueda y espera que React renderice los productos
+    3. Extrae del DOM renderizado
+    También intenta la API de catálogo VTEX desde dentro del browser
+    """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
-    scraper = _make_scraper()
+
+    try:
+        driver.get("https://www.sodimac.com.ar/")
+        time.sleep(2)
+    except Exception as exc:
+        result["error"] = f"Sodimac warmup error: {exc}"
+        return result
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
-        q_corta = " ".join(query.split()[:5])
+        palabras = query.split()
+        q_full   = urllib.parse.quote(" ".join(palabras[:4]))
+        q_short  = urllib.parse.quote(palabras[0]) if palabras else q_full
 
-        candidatos = _rex_graphql_candidatos(scraper, q_corta)
+        candidatos: list[dict] = []
+
+        # A) API VTEX catalog desde dentro del browser (misma sesión)
+        for api_url in [
+            f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_full}?_from=0&_to=9",
+            f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_short}?_from=0&_to=9",
+            f"https://www.sodimac.com.ar/_v/api/intelligent-search/product_search/trade-policy/1?query={q_full}&count=10",
+        ]:
+            data = _fetch_api_en_browser(driver, api_url)
+            if isinstance(data, list):
+                candidatos = _vtex_candidatos_de_json(data, "https://www.sodimac.com.ar")
+            elif isinstance(data, dict):
+                candidatos = _vtex_intelligent_search(data, "https://www.sodimac.com.ar")
+            if candidatos:
+                break
+
+        # B) Si API vacía: navegar a la página de búsqueda y parsear el DOM renderizado
         if not candidatos:
-            candidatos = _rex_rest_candidatos(scraper, q_corta)
+            try:
+                search_url = (
+                    f"https://www.sodimac.com.ar/sodimac-ar/search?"
+                    + urllib.parse.urlencode({"Ntt": " ".join(palabras[:4])})
+                )
+                driver.get(search_url)
+                # Esperar a que React renderice las tarjetas de producto
+                _esperar_render(driver, "[class*='product'], [class*='Product'], article", timeout=8)
+                time.sleep(1)  # Margen extra para carga lazy de precios
+                candidatos = _sodimac_candidatos_de_html(driver.page_source)
+            except Exception as exc:
+                logger.warning("Sodimac search page error: %s", exc)
 
         mejor = _elegir_mejor(candidatos, ref)
         if mejor:
-            result.update(
-                precio=mejor["precio"], url=mejor["link"],
-                nombre=mejor["nombre"], intento=i, score=mejor["score"],
-            )
+            result.update(precio=mejor["precio"], url=mejor["link"],
+                          nombre=mejor["nombre"], intento=i, score=mejor["score"])
             break
 
-    if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en Rex"
+    if result["precio"] is None:
+        result["error"] = "Sin resultados en Sodimac"
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# MERCADO LIBRE — API + HTML (warmup de sesión)
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# MERCADO LIBRE
+# El anti-bot es fuerte pero un browser real con stealth ayuda
+# ════════════════════════════════════════════════════════════════════════════
 
 def _ml_candidatos_de_html(html: str) -> list[dict]:
     cands = _candidatos_de_jsonld(html)
-
     if len(cands) < 3:
-        for blk in re.split(
-            r'<li[^>]*class="[^"]*ui-search-layout__item[^"]*"', html
-        )[1:]:
+        for blk in re.split(r'<li[^>]*class="[^"]*ui-search-layout__item[^"]*"', html)[1:]:
             t = (
                 re.search(r'class="[^"]*ui-search-item__title[^"]*"[^>]*>(.*?)<', blk, re.DOTALL)
+                or re.search(r'class="[^"]*poly-component__title[^"]*"[^>]*>(.*?)<', blk, re.DOTALL)
                 or re.search(r'<h[23][^>]*>(.*?)</h[23]>', blk, re.DOTALL)
             )
-            href  = re.search(r'href="(https://[^"]*mercadolibre[^"]*)"', blk)
+            href = re.search(r'href="(https://[^"]*mercadolibre[^"]*)"', blk)
             price = (
                 re.search(r'andes-money-amount__fraction[^>]*>([\d.\s]+)<', blk)
                 or re.search(r'price-tag-fraction[^>]*>([\d.\s]+)<', blk)
@@ -869,74 +787,60 @@ def _ml_candidatos_de_html(html: str) -> list[dict]:
                         "link":   href.group(1).split("#")[0],
                         "precio": _clean_price(price.group(1)) if price else None,
                     })
+    return _dedup(cands)
 
-    return _dedup_candidatos(cands)
 
-
-def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
+def _scrape_ml_browser(driver, detalle: str, marca: str,
+                        cod_proveedor, nombre_proveedor: str) -> dict:
     """
-    MercadoLibre — como un humano:
-    1. Visita la homepage de ML (establece cookies de sesión)
-    2. Intenta la API oficial con esas cookies
-    3. Si falla la API, intenta el HTML de listado
+    Como un humano:
+    1. Abre mercadolibre.com.ar (establece sesión ML)
+    2. Intenta la API desde dentro del browser (hereda cookies de sesión ML)
+    3. Si no: navega al listado y espera que React renderice
     """
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
-    scraper = _make_scraper()
 
-    # ── Paso humano 1: visitar ML para establecer sesión ──────────────────────
-    _warm_session(scraper, "https://www.mercadolibre.com.ar/",
-                  referer="https://www.google.com.ar/search?q=mercadolibre+argentina")
+    try:
+        driver.get("https://www.mercadolibre.com.ar/")
+        time.sleep(2)
+    except Exception as exc:
+        result["error"] = f"ML warmup error: {exc}"
+        return result
 
     for i, item in enumerate(queries, start=1):
         query, ref = item["q"], item["ref"]
         q_corta = " ".join(query.split()[:3])
         candidatos: list[dict] = []
 
-        # A) API oficial
-        try:
-            api_url = (
-                f"https://api.mercadolibre.com/sites/MLA/search"
-                f"?q={urllib.parse.quote(q_corta)}&limit=10"
-            )
-            resp = scraper.get(
-                api_url, timeout=12,
-                headers={
-                    **HEADERS_API,
-                    "Referer": "https://www.mercadolibre.com.ar/",
-                },
-            )
-            if resp.status_code == 200:
-                for prod in resp.json().get("results", [])[:10]:
-                    candidatos.append({
-                        "nombre": prod.get("title"),
-                        "link":   prod.get("permalink"),
-                        "precio": _clean_price(prod.get("price")),
-                    })
-        except Exception as exc:
-            logger.warning("ML API error: %s", exc)
+        # A) API de ML desde dentro del browser (hereda sesión ML)
+        api_url = (
+            f"https://api.mercadolibre.com/sites/MLA/search"
+            f"?q={urllib.parse.quote(q_corta)}&limit=10"
+        )
+        data = _fetch_api_en_browser(driver, api_url)
+        if isinstance(data, dict):
+            for prod in data.get("results", [])[:10]:
+                candidatos.append({
+                    "nombre": prod.get("title"),
+                    "link":   prod.get("permalink"),
+                    "precio": _clean_price(prod.get("price")),
+                })
 
-        # B) Listado HTML (paso humano: navegar a la URL de listado)
+        # B) Si la API sigue bloqueada: navegar al listado y parsear el DOM
         if not candidatos:
-            for url_listado in [
-                f"https://listado.mercadolibre.com.ar/{urllib.parse.quote(q_corta.replace(' ', '-'))}",
-                f"https://www.mercadolibre.com.ar/buscar?q={urllib.parse.quote(q_corta)}",
-            ]:
-                try:
-                    resp = scraper.get(
-                        url_listado, timeout=15,
-                        headers={
-                            **HEADERS_NAV,
-                            "Referer": "https://www.mercadolibre.com.ar/",
-                            "Sec-Fetch-Site": "same-origin",
-                        },
-                    )
-                    if resp.status_code == 200 and "suspicious-traffic" not in resp.url:
-                        candidatos = _ml_candidatos_de_html(resp.text)
-                        if candidatos:
-                            break
-                except Exception as exc:
-                    logger.warning("ML listado error: %s", exc)
+            try:
+                slug = urllib.parse.quote(q_corta.replace(" ", "-").lower())
+                listado_url = f"https://listado.mercadolibre.com.ar/{slug}"
+                driver.get(listado_url)
+                # Esperar que React renderice los ítems
+                _esperar_render(driver, ".ui-search-layout__item, .ui-search-result", timeout=10)
+                time.sleep(1)
+                html = driver.page_source
+                if "suspicious-traffic" not in driver.current_url:
+                    candidatos = _ml_candidatos_de_html(html)
+            except Exception as exc:
+                logger.warning("ML listado error: %s", exc)
 
         if not candidatos:
             continue
@@ -951,134 +855,291 @@ def scrape_ml(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) ->
         top = relevantes[:5]
         precios = sorted(c["precio"] for c in top)
         mediana = precios[len(precios) // 2]
-        mejor   = top[0]
-        result.update(
-            precio=mediana, url=mejor.get("link"),
-            nombre=mejor.get("nombre"), intento=i, score=mejor["score"],
-        )
+        result.update(precio=mediana, url=top[0].get("link"),
+                      nombre=top[0].get("nombre"), intento=i, score=top[0]["score"])
         break
 
-    if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en ML (bloqueado por anti-bot)"
+    if result["precio"] is None:
+        result["error"] = "Sin resultados en ML (anti-bot activo)"
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# SODIMAC — VTEX (mismo enfoque que Easy)
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# REX — Magento 2 GraphQL + REST (ya funciona ✓)
+# ════════════════════════════════════════════════════════════════════════════
 
-def scrape_sodimac(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
-    """
-    Sodimac Argentina — VTEX, como un humano:
-    1. Visita la homepage (establece cookies VTEX)
-    2. Llama a la API de catálogo/intelligent-search con esas cookies
-    """
+def _make_session():
+    if _HAS_CLOUDSCRAPER:
+        sc = _cs_mod.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        sc.headers.update(HEADERS)
+        return sc
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+def _rex_graphql(session, query: str) -> list[dict]:
+    gql = {
+        "query": '{ products(search: "%s", pageSize: 10) { items { name url_key '
+                 'price_range { minimum_price { final_price { value } regular_price { value } } } } } }'
+                 % query.replace('"', '\\"')
+    }
+    try:
+        r = session.post(
+            "https://www.somosrex.com/graphql",
+            json=gql,
+            headers={**HEADERS, "Content-Type": "application/json", "Accept": "application/json"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return []
+        items = r.json().get("data", {}).get("products", {}).get("items", [])
+        return [
+            {
+                "nombre": p.get("name"),
+                "link":   f"https://www.somosrex.com/{p.get('url_key','')}.html",
+                "precio": _clean_price(
+                    p.get("price_range", {}).get("minimum_price", {})
+                    .get("final_price", {}).get("value")
+                    or p.get("price_range", {}).get("minimum_price", {})
+                    .get("regular_price", {}).get("value")
+                ),
+            }
+            for p in items[:10] if p.get("name")
+        ]
+    except Exception as exc:
+        logger.warning("Rex GraphQL: %s", exc)
+        return []
+
+
+def _rex_rest(session, query: str) -> list[dict]:
+    q_enc = urllib.parse.quote(f"%{query}%")
+    url = (
+        "https://www.somosrex.com/rest/all/V1/products"
+        f"?searchCriteria[filterGroups][0][filters][0][field]=name"
+        f"&searchCriteria[filterGroups][0][filters][0][value]={q_enc}"
+        f"&searchCriteria[filterGroups][0][filters][0][condition_type]=like"
+        f"&searchCriteria[pageSize]=10"
+        f"&fields=items[name,price,url_key]"
+    )
+    try:
+        r = session.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=20)
+        if r.status_code != 200:
+            return []
+        return [
+            {
+                "nombre": p.get("name"),
+                "link":   f"https://www.somosrex.com/{p.get('url_key','')}.html",
+                "precio": _clean_price(p.get("price")),
+            }
+            for p in r.json().get("items", [])[:10] if p.get("name")
+        ]
+    except Exception as exc:
+        logger.warning("Rex REST: %s", exc)
+        return []
+
+
+def scrape_rex(detalle: str, marca: str, cod_proveedor, nombre_proveedor: str) -> dict:
     queries = _build_queries(detalle, marca, cod_proveedor)
     result  = _empty_result()
-    scraper = _make_scraper()
-
-    # ── Paso humano 1: visitar homepage para obtener cookies VTEX ────────────
-    _warm_session(scraper, "https://www.sodimac.com.ar/",
-                  referer="https://www.google.com.ar/search?q=sodimac+argentina+materiales")
+    session = _make_session()
 
     for i, item in enumerate(queries, start=1):
-        query, ref = item["q"], item["ref"]
-        q_palabras    = " ".join(query.split()[:4])
-        q_enc         = urllib.parse.quote(q_palabras)
-        q_corta_enc   = urllib.parse.quote(query.split()[0]) if query.split() else q_enc
-        candidatos: list[dict] = []
+        q_corta = " ".join(item["q"].split()[:5])
+        ref     = item["ref"]
 
-        endpoints = [
-            # VTEX Catalog API legacy (mismo formato que Easy, probado)
-            (
-                f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_enc}"
-                f"?_from=0&_to=9",
-                "list",
-            ),
-            (
-                f"https://www.sodimac.com.ar/api/catalog_system/pub/products/search/{q_corta_enc}"
-                f"?_from=0&_to=9",
-                "list",
-            ),
-            # VTEX Intelligent Search
-            (
-                f"https://www.sodimac.com.ar/_v/api/intelligent-search/product_search/trade-policy/1"
-                f"?query={q_enc}&count=10&sort=score_desc",
-                "is",
-            ),
-            # Sodimac search antiguo
-            (
-                f"https://www.sodimac.com.ar/sodimac-ar/search?Ntt={q_enc}&format=json",
-                "is",
-            ),
-        ]
-
-        for api_url, fmt in endpoints:
-            try:
-                resp = scraper.get(
-                    api_url, timeout=20,
-                    headers={
-                        **HEADERS_API,
-                        "Referer": "https://www.sodimac.com.ar/",
-                        "Sec-Fetch-Site": "same-origin",
-                    },
-                )
-                if resp.status_code != 200:
-                    logger.debug("Sodimac HTTP %d: %s", resp.status_code, api_url[:80])
-                    continue
-                try:
-                    data = resp.json()
-                except Exception:
-                    continue  # Devolvió HTML (sin cookies válidas)
-
-                if fmt == "list":
-                    candidatos = _vtex_candidatos_de_json(data, "https://www.sodimac.com.ar")
-                else:
-                    candidatos = _vtex_intelligent_search_candidatos(
-                        data, "https://www.sodimac.com.ar"
-                    )
-                if candidatos:
-                    break
-            except Exception as exc:
-                logger.warning("Sodimac endpoint error: %s", exc)
-
-        mejor = _elegir_mejor(candidatos, ref)
+        cands = _rex_graphql(session, q_corta) or _rex_rest(session, q_corta)
+        mejor = _elegir_mejor(cands, ref)
         if mejor:
-            result.update(
-                precio=mejor["precio"], url=mejor["link"],
-                nombre=mejor["nombre"], intento=i, score=mejor["score"],
-            )
+            result.update(precio=mejor["precio"], url=mejor["link"],
+                          nombre=mejor["nombre"], intento=i, score=mejor["score"])
             break
 
-    if result["precio"] is None and result["error"] is None:
-        result["error"] = "Sin resultados en Sodimac (VTEX puede requerir sesión)"
+    if result["precio"] is None:
+        result["error"] = "Sin resultados en Rex"
     return result
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # Orquestador principal
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def buscar_precios(detalle: str, marca: str,
                    cod_proveedor=None,
                    nombre_proveedor: str = "") -> dict[str, dict]:
-    """Ejecuta los 5 scrapers en paralelo."""
+    """
+    Estrategia de ejecución:
+    - Rex: background thread (API pura, rápida, no necesita browser)
+    - Sagitario / Easy / Sodimac / ML: UNA sola instancia de Chrome compartida,
+      ejecutados secuencialmente para no consumir más de ~300MB de RAM
+
+    Si Selenium no está disponible (no hay Chrome), cae a requests.
+    """
     args = (detalle, marca, cod_proveedor, nombre_proveedor)
-    scrapers_map = {
-        "rex":       scrape_rex,
-        "sagitario": scrape_sagitario,
-        "ml":        scrape_ml,
-        "sodimac":   scrape_sodimac,
-        "easy":      scrape_easy,
-    }
     resultados: dict[str, dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {name: ex.submit(fn, *args) for name, fn in scrapers_map.items()}
-        for name, fut in futures.items():
+
+    # Rex corre en paralelo desde el principio
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    rex_fut  = executor.submit(scrape_rex, *args)
+
+    # Driver compartido para los 4 scrapers restantes
+    driver = _make_driver()
+
+    if driver:
+        scrapers_browser = [
+            ("sagitario", _scrape_sagitario_browser),
+            ("easy",      _scrape_easy_browser),
+            ("sodimac",   _scrape_sodimac_browser),
+            ("ml",        _scrape_ml_browser),
+        ]
+        try:
+            for nombre_sitio, fn in scrapers_browser:
+                try:
+                    resultados[nombre_sitio] = fn(driver, *args)
+                except Exception as exc:
+                    r = _empty_result()
+                    r["error"] = str(exc)
+                    resultados[nombre_sitio] = r
+        finally:
             try:
-                resultados[name] = fut.result(timeout=45)
-            except Exception as exc:
-                r = _empty_result()
-                r["error"] = str(exc)
-                resultados[name] = r
+                driver.quit()
+            except Exception:
+                pass
+    else:
+        # Fallback: requests con cloudscraper (sin browser)
+        logger.warning("Selenium no disponible — usando requests como fallback")
+        fallback_scrapers = {
+            "sagitario": _scrape_sagitario_requests,
+            "easy":      _scrape_easy_requests,
+            "sodimac":   _scrape_sodimac_requests,
+            "ml":        _scrape_ml_requests,
+        }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {n: ex.submit(fn, *args) for n, fn in fallback_scrapers.items()}
+            for n, fut in futs.items():
+                try:
+                    resultados[n] = fut.result(timeout=40)
+                except Exception as exc:
+                    r = _empty_result()
+                    r["error"] = str(exc)
+                    resultados[n] = r
+
+    # Recoger resultado de Rex
+    try:
+        resultados["rex"] = rex_fut.result(timeout=45)
+    except Exception as exc:
+        r = _empty_result()
+        r["error"] = str(exc)
+        resultados["rex"] = r
+    finally:
+        executor.shutdown(wait=False)
+
     return resultados
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FALLBACK con requests (si Selenium no está disponible)
+# ============================================================================
+
+def _scrape_sagitario_requests(detalle, marca, cod_proveedor, nombre_proveedor):
+    """Fallback Sagitario usando cloudscraper (puede fallar en datacenter IPs)."""
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        q = _build_query(detalle, marca, cod_proveedor, nombre_proveedor)
+        url = f"https://pintureriasagitario.com.ar/?s={urllib.parse.quote_plus(q)}&post_type=product"
+        # Warmup homepage
+        scraper.get("https://pintureriasagitario.com.ar/", timeout=10)
+        time.sleep(1)
+        r = scraper.get(url, timeout=15)
+        if r.status_code != 200:
+            res = _empty_result()
+            res["error"] = f"HTTP {r.status_code}"
+            return res
+        candidatos = _sagitario_candidatos_de_html(r.text)
+        return _best_match(candidatos, detalle, marca)
+    except Exception as exc:
+        res = _empty_result()
+        res["error"] = str(exc)
+        return res
+
+
+def _scrape_easy_requests(detalle, marca, cod_proveedor, nombre_proveedor):
+    """Fallback Easy usando VTEX Catalog API con requests."""
+    try:
+        q = _build_query(detalle, marca, cod_proveedor, nombre_proveedor)
+        q_short = detalle.strip() if detalle else q
+        headers = {
+            "User-Agent": _UA,
+            "Accept": "application/json",
+            "Referer": "https://www.easy.com.ar/",
+        }
+        sess = requests.Session()
+        # Warmup to get session cookies
+        try:
+            sess.get("https://www.easy.com.ar/", headers=headers, timeout=10)
+        except Exception:
+            pass
+        for query in [q, q_short]:
+            url = (
+                f"https://www.easy.com.ar/api/catalog_system/pub/products/search/"
+                f"{urllib.parse.quote(query)}?_from=0&_to=9"
+            )
+            try:
+                resp = sess.get(url, headers=headers, timeout=12)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data:
+                        candidatos = _easy_parse_vtex(data)
+                        res = _best_match(candidatos, detalle, marca)
+                        if res.get("precio"):
+                            return res
+            except Exception:
+                continue
+        res = _empty_result()
+        res["error"] = "Sin resultados Easy (requiere browser para VTEX)"
+        return res
+    except Exception as exc:
+        res = _empty_result()
+        res["error"] = str(exc)
+        return res
+
+
+def _scrape_sodimac_requests(detalle, marca, cod_proveedor, nombre_proveedor):
+    """Sodimac requiere browser SPA — no disponible en modo requests."""
+    res = _empty_result()
+    res["error"] = "Sodimac requiere Selenium (SPA React)"
+    return res
+
+
+def _scrape_ml_requests(detalle, marca, cod_proveedor, nombre_proveedor):
+    """Fallback MercadoLibre usando API publica."""
+    try:
+        q = _build_query(detalle, marca, cod_proveedor, nombre_proveedor)
+        url = (
+            f"https://api.mercadolibre.com/sites/MLA/search"
+            f"?q={urllib.parse.quote(q)}&limit=10"
+        )
+        headers = {"User-Agent": _UA, "Accept": "application/json"}
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            res = _empty_result()
+            res["error"] = f"ML API HTTP {r.status_code}"
+            return res
+        data = r.json()
+        candidatos = []
+        for item in data.get("results", []):
+            nombre = item.get("title", "")
+            precio = item.get("price")
+            link = item.get("permalink", "")
+            if nombre and precio:
+                candidatos.append({"nombre": nombre, "precio": float(precio), "link": link})
+        return _best_match(candidatos, detalle, marca)
+    except Exception as exc:
+        res = _empty_result()
+        res["error"] = str(exc)
+        return res
